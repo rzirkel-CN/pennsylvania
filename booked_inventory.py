@@ -446,6 +446,14 @@ def cmd_probe(db: sqlite3.Connection, args: argparse.Namespace) -> int:
         total = db.execute("SELECT count(*) FROM host").fetchone()[0]
         print("No hosts known; run 'update' first." if not total else f"All {total} hosts are fresh; use --force to re-probe.")
         return 0
+    if not args.hosts and not args.force:
+        # Explain the skip so a small batch is not mistaken for a bug.
+        total = db.execute("SELECT count(*) FROM host").fetchone()[0]
+        print(
+            f"Probing {len(hosts)} of {total} hosts ({total - len(hosts)} probed within the last "
+            f"{args.max_age:g}h are cached; use --force to re-probe all, --max-age to change the window)",
+            file=sys.stderr,
+        )
     _probe_hosts(db, hosts, args, show_progress=getattr(args, "discover", False))
     return 0
 
