@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # noqa: SIZE_OK — the requested single-file CLI owns its complete offline inventory workflow.
-"""Inventory Cornelis lab hosts from Booked Scheduler and read-only SSH probes.
+"""cnhwinv - Cornelis Networks Hardware Inventory.
+
+Inventories Cornelis lab hosts from Booked Scheduler, fabric discovery, and
+read-only SSH probes.
 
 The SQLite cache is the reporting source of truth: `list`, `show`, `links`, and
 `status` never contact Booked or any lab host. Use `update` to refresh it.
@@ -29,7 +32,10 @@ BOOKED_API = "http://booked.cornelisnetworks.com/Web/Services/index.php"
 HOSTS_ATTR_ID = 2
 CN_VENDOR = "434e"
 GEN_BY_DEVICE = {"0001": "CN5000", "0002": "CN6000"}
-DEFAULT_DB = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "booked-inventory/inventory.db"
+_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+DEFAULT_DB = _DATA_HOME / "cnhwinv/inventory.db"
+# Cache location used before the tool was renamed from booked_inventory.
+LEGACY_DB = _DATA_HOME / "booked-inventory/inventory.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fabric_node (
@@ -60,12 +66,12 @@ TOP_DESCRIPTION = """Inspect the local Booked Scheduler inventory cache without 
 `update` is the only convenience command that contacts Booked and SSH-probes
 hosts. Remote probes and discovery are strictly read-only."""
 TOP_EPILOG = """Common examples:
-  booked_inventory.py status
-  booked_inventory.py update --max-age 24
-  booked_inventory.py ls --gen 6k --reachable -w
-  booked_inventory.py show cn123
-  booked_inventory.py links --gen CN5000
-  booked_inventory.py --db /tmp/inventory.db list --json
+  cnhwinv status
+  cnhwinv update --max-age 24
+  cnhwinv ls --gen 6k --reachable -w
+  cnhwinv show cn123
+  cnhwinv links --gen CN5000
+  cnhwinv --db /tmp/inventory.db list --json
 """
 
 # Junk tokens seen in the Booked "Hosts" free-text field.
@@ -1250,7 +1256,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers,
         "sync-booked",
         help_text="Fetch Booked resources into the local cache (no SSH).",
-        examples="booked_inventory.py sync-booked",
+        examples="cnhwinv sync-booked",
     )
 
     def probe_options(command: argparse.ArgumentParser) -> None:
@@ -1263,7 +1269,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers,
         "probe",
         help_text="Read-only SSH probe of named or stale cached hosts.",
-        examples="booked_inventory.py probe cn123\n  booked_inventory.py probe --force --jobs 8",
+        examples="cnhwinv probe cn123\n  cnhwinv probe --force --jobs 8",
     )
     probe.add_argument("hosts", nargs="*", help="specific hosts to probe")
     probe_options(probe)
@@ -1273,7 +1279,7 @@ def build_parser() -> argparse.ArgumentParser:
         "update",
         aliases=["refresh"],
         help_text="Refresh Booked resources and read-only probe stale hosts.",
-        examples="booked_inventory.py update --max-age 24\n  booked_inventory.py refresh --discover",
+        examples="cnhwinv update --max-age 24\n  cnhwinv refresh --discover",
     )
     update.set_defaults(hosts=[])
     probe_options(update)
@@ -1283,7 +1289,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers,
         "discover",
         help_text="Discover unbooked fabric hosts using read-only SA queries.",
-        examples="booked_inventory.py discover --jobs 8",
+        examples="cnhwinv discover --jobs 8",
     )
     discover.add_argument("--jobs", type=int, default=16, help="parallel SA queries (default: 16)")
     discover.add_argument("--timeout", type=int, default=60, help="per-host timeout in seconds (default: 60)")
@@ -1292,7 +1298,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers,
         "status",
         help_text="Show local cache age and probe coverage without network access.",
-        examples="booked_inventory.py status\n  booked_inventory.py status --json",
+        examples="cnhwinv status\n  cnhwinv status --json",
     )
     status.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
@@ -1301,7 +1307,7 @@ def build_parser() -> argparse.ArgumentParser:
         "list",
         aliases=["ls"],
         help_text="List cached hosts; use filters without contacting Booked or SSH.",
-        examples="booked_inventory.py ls --gen 6k --reachable -w\n  booked_inventory.py list --source discovered --json",
+        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --source discovered --json",
     )
     listing.add_argument("--gen", type=_generation_argument, metavar="GEN", help="5k/6k/CN5000/CN6000, mixed, none, or unprobed")
     listing.add_argument("--reachable", action="store_true", help="only latest probes that were reachable")
@@ -1316,7 +1322,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers,
         "show",
         help_text="Show one host or one Booked resource from the cache.",
-        examples="booked_inventory.py show cn123\n  booked_inventory.py show 'Rack A' --json",
+        examples="cnhwinv show cn123\n  cnhwinv show 'Rack A' --json",
     )
     show.add_argument("host", metavar="HOST_OR_RESOURCE", help="case-insensitive full or unique partial name")
     show.add_argument("--json", action="store_true", help="emit machine-readable JSON")
@@ -1325,7 +1331,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers,
         "links",
         help_text="Show cached fabric and Ethernet neighbor evidence.",
-        examples="booked_inventory.py links\n  booked_inventory.py links --gen CN6000 --json",
+        examples="cnhwinv links\n  cnhwinv links --gen CN6000 --json",
     )
     links.add_argument("--gen", type=_link_generation_argument, metavar="GEN", help="5k/6k/CN5000, or CN6000")
     links.add_argument("--json", action="store_true", help="emit machine-readable JSON")
@@ -1372,6 +1378,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "show": cmd_show,
         "links": cmd_links,
     }
+    if args.db == DEFAULT_DB and not DEFAULT_DB.exists() and LEGACY_DB.exists():
+        # Carry the cache over from the pre-rename location instead of starting empty.
+        DEFAULT_DB.parent.mkdir(parents=True, exist_ok=True)
+        LEGACY_DB.rename(DEFAULT_DB)
+        print(f"Moved cache {LEGACY_DB} -> {DEFAULT_DB}", file=sys.stderr)
     try:
         db = open_db(args.db)
         try:

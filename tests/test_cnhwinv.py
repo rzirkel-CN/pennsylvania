@@ -1,4 +1,4 @@
-"""Regression tests for the offline, stdlib-only Booked inventory CLI."""
+"""Regression tests for the offline, stdlib-only cnhwinv (Cornelis Networks Hardware Inventory) CLI."""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ _TEST_HOME = tempfile.TemporaryDirectory()
 os.environ["XDG_DATA_HOME"] = _TEST_HOME.name
 os.environ["XDG_STATE_HOME"] = _TEST_HOME.name
 
-import booked_inventory as bi
+import cnhwinv as bi
 
 
 PROBE_OUTPUT = """@@FQDN cn-host01.example.com

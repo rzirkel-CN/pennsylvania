@@ -3,5 +3,5 @@
 set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
-python3 -m py_compile booked_inventory.py
+python3 -m py_compile cnhwinv.py
 python3 -m unittest discover -s tests -v

@@ -1,1 +1,1 @@
-"""Stdlib regression tests for booked_inventory."""
+"""Stdlib regression tests for cnhwinv."""
