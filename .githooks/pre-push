@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Prevent pushing code that fails the same fast offline regression suite.
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+python3 -m unittest discover -s tests -v

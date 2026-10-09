@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run the complete offline regression suite before a commit is recorded.
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+python3 -m py_compile booked_inventory.py
+python3 -m unittest discover -s tests -v
