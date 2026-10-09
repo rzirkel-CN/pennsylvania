@@ -1,6 +1,7 @@
 """Regression tests for the offline, stdlib-only Booked inventory CLI."""
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -363,6 +364,108 @@ opasmaquery: failed to open port: Device or resource busy
             with self.assertRaises(bi.UserError) as caught:
                 bi._creds()
         self.assertIn("Booked credentials file is unavailable", str(caught.exception))
+
+    def discover_args(self) -> argparse.Namespace:
+        return argparse.Namespace(jobs=4, timeout=30)
+
+    def add_opa_port(self, host: str, guid: str, *, port_guid: str | None = None) -> None:
+        self.db.execute(
+            "INSERT INTO port(host, ifname, port, kind, node_guid, port_guid, state) "
+            "VALUES (?, 'hfi1_0', 1, 'opa', ?, ?, 'ACTIVE')",
+            (host, guid, port_guid),
+        )
+        self.db.commit()
+
+    def test_discover_queries_one_vantage_when_its_sa_results_cover_other_hosts(self) -> None:
+        self.add_host("vantage01")
+        self.add_host("zcovered02")
+        self.add_opa_port("vantage01", "0xaaa")
+        self.add_opa_port("zcovered02", "0xbbb")
+        responses = {
+            "vantage01": [
+                {"guid": "0xaaa", "type": "FI", "name": "vantage01 hfi1_0"},
+                {"guid": "0xbbb", "type": "FI", "name": "zcovered02 hfi1_0"},
+            ]
+        }
+        with mock.patch.object(bi, "_sa_query", side_effect=lambda host, _: (host, responses[host])) as query, mock.patch.object(
+            bi, "_probe_hosts"
+        ):
+            code = bi.cmd_discover(self.db, self.discover_args())
+        self.assertEqual(code, 0)
+        self.assertEqual(query.call_args_list, [mock.call("vantage01", 30)])
+
+    def test_discover_treats_guid_owned_fi_as_known_even_when_name_differs(self) -> None:
+        self.add_host("vantage01")
+        self.add_host("booked01")
+        self.add_opa_port("vantage01", "0xaaa")
+        self.add_opa_port("booked01", "0xnode-owned", port_guid="0xport-owned")
+        nodes = [
+            {"guid": "0xaaa", "type": "FI", "name": "vantage01 hfi1_0"},
+            {"guid": "0xport-owned", "type": "FI", "name": "different-name hfi1_0"},
+        ]
+        with mock.patch.object(bi, "_sa_query", return_value=("vantage01", nodes)), mock.patch.object(bi, "_probe_hosts") as probe:
+            bi.cmd_discover(self.db, self.discover_args())
+        self.assertIsNone(self.db.execute("SELECT name FROM host WHERE name='different-name'").fetchone())
+        probe.assert_not_called()
+
+    def test_discover_treats_fqdn_short_name_as_known(self) -> None:
+        self.add_host("arm-01.cornelisnetworks.com")
+        self.add_host("vantage01")
+        self.add_opa_port("vantage01", "0xaaa")
+        nodes = [
+            {"guid": "0xaaa", "type": "FI", "name": "vantage01 hfi1_0"},
+            {"guid": "0xarm", "type": "FI", "name": "arm-01 hfi1_0"},
+        ]
+        with mock.patch.object(bi, "_sa_query", return_value=("vantage01", nodes)), mock.patch.object(bi, "_probe_hosts") as probe:
+            bi.cmd_discover(self.db, self.discover_args())
+        self.assertIsNone(self.db.execute("SELECT name FROM host WHERE name='arm-01'").fetchone())
+        probe.assert_not_called()
+
+    def test_discover_reports_denylisted_adapter_without_creating_a_host(self) -> None:
+        self.add_host("vantage01")
+        self.add_opa_port("vantage01", "0xaaa")
+        nodes = [
+            {"guid": "0xaaa", "type": "FI", "name": "vantage01 hfi1_0"},
+            {"guid": "0xjkr", "type": "FI", "name": "JKR MFG"},
+        ]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), mock.patch.object(bi, "_sa_query", return_value=("vantage01", nodes)), mock.patch.object(
+            bi, "_probe_hosts"
+        ) as probe:
+            bi.cmd_discover(self.db, self.discover_args())
+        self.assertIsNone(self.db.execute("SELECT name FROM host WHERE name='jkr'").fetchone())
+        self.assertIn("Unnamed adapters: 0xjkr", stdout.getvalue())
+        probe.assert_not_called()
+
+    def test_discover_removes_bogus_discovered_host_owned_by_another_host(self) -> None:
+        self.add_host("vantage01")
+        self.add_host("asic-fw-10")
+        self.add_host("jkr", source="discovered")
+        self.add_adapter("jkr", "0000:01:00.0", "CN5000")
+        self.add_opa_port("vantage01", "0xaaa")
+        self.add_opa_port("asic-fw-10", "0xjkr")
+        self.add_opa_port("jkr", "0xold")
+        self.add_resource(1, "orphan resource", ["jkr"])
+        with mock.patch.object(bi, "_sa_query", return_value=("vantage01", [{"guid": "0xaaa", "type": "FI", "name": "vantage01 hfi1_0"}])), mock.patch.object(
+            bi, "_probe_hosts"
+        ):
+            bi.cmd_discover(self.db, self.discover_args())
+        self.assertIsNone(self.db.execute("SELECT name FROM host WHERE name='jkr'").fetchone())
+        self.assertEqual(self.db.execute("SELECT count(*) FROM adapter WHERE host='jkr'").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM port WHERE host='jkr'").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM resource_host WHERE host='jkr'").fetchone()[0], 0)
+
+    def test_discover_inserts_and_probes_a_genuinely_new_host(self) -> None:
+        self.add_host("vantage01")
+        self.add_opa_port("vantage01", "0xaaa")
+        nodes = [
+            {"guid": "0xaaa", "type": "FI", "name": "vantage01 hfi1_0"},
+            {"guid": "0xnew", "type": "FI", "name": "opx-emr-006 hfi1_0"},
+        ]
+        with mock.patch.object(bi, "_sa_query", return_value=("vantage01", nodes)), mock.patch.object(bi, "_probe_hosts") as probe:
+            bi.cmd_discover(self.db, self.discover_args())
+        self.assertEqual(self.db.execute("SELECT source FROM host WHERE name='opx-emr-006'").fetchone()[0], "discovered")
+        probe.assert_called_once_with(self.db, ["opx-emr-006"], mock.ANY, show_progress=True)
 
     def test_remote_probe_and_discovery_scripts_exclude_state_changing_commands(self) -> None:
         scripts = f"{bi.REMOTE_SCRIPT}\n{bi.DISCOVER_SCRIPT}"

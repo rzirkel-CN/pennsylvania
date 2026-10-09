@@ -551,46 +551,228 @@ def _fi_hostname(name: str) -> str | None:
     return token if re.fullmatch(r"[a-z0-9][a-z0-9-]*", token) else None
 
 
+_UNNAMED_FI_TOKENS = frozenset({"cyr", "hfi", "jkr", "localhost", "mfg", "wfr"})
+
+
+def _name_aliases(name: str | None) -> set[str]:
+    """Return the full and short forms used by fabric node descriptions."""
+    value = (name or "").strip().lower().rstrip(".")
+    return {value, value.split(".", 1)[0]} if value else set()
+
+
+def _is_unnamed_adapter(name: str) -> bool:
+    """Identify vendor/default node descriptions that are not host identities."""
+    hostname = _fi_hostname(name)
+    return hostname in _UNNAMED_FI_TOKENS if hostname else False
+
+
+def _known_host_aliases(db: sqlite3.Connection) -> set[str]:
+    """Return host and FQDN aliases that identify already-known adapters."""
+    aliases: set[str] = set()
+    for name, fqdn in db.execute("SELECT name, fqdn FROM host"):
+        aliases.update(_name_aliases(name))
+        aliases.update(_name_aliases(fqdn))
+    return aliases
+
+
+def _port_guid_owners(db: sqlite3.Connection) -> dict[str, set[str]]:
+    """Map lower-cased port GUIDs to all cached hosts that own them."""
+    owners: dict[str, set[str]] = {}
+    for host, node_guid, port_guid in db.execute("SELECT host, node_guid, port_guid FROM port"):
+        for guid in (node_guid, port_guid):
+            if guid:
+                owners.setdefault(guid.lower(), set()).add(host.lower())
+    return owners
+
+
+def _known_port_guids(db: sqlite3.Connection) -> dict[str, set[str]]:
+    """Return every known host's node and port GUIDs for SA coverage checks."""
+    hosts: dict[str, set[str]] = {}
+    for host, node_guid, port_guid in db.execute("SELECT host, node_guid, port_guid FROM port"):
+        guids = hosts.setdefault(host, set())
+        guids.update(guid.lower() for guid in (node_guid, port_guid) if guid)
+    return hosts
+
+
+def _active_discovery_hosts(db: sqlite3.Connection) -> set[str]:
+    """Return reachable hosts with at least one active Cornelis port."""
+    return {
+        host
+        for (host,) in db.execute(
+            "SELECT DISTINCT h.name FROM host h JOIN port p ON p.host=h.name "
+            "WHERE h.reachable=1 AND p.kind='opa' AND p.state='ACTIVE'"
+        )
+    }
+
+
+def _fabric_covered_hosts(db: sqlite3.Connection, visible_guids: set[str]) -> set[str]:
+    """Return hosts that querying would not reveal anything new from."""
+    owned = {guid.lower() for guid in _guid_owner(db)}
+    ports: dict[str, list[tuple[str | None, str | None]]] = {}
+    for host, ntype, nguid in db.execute("SELECT host, neighbor_type, neighbor_guid FROM port WHERE kind='opa' AND state='ACTIVE'"):
+        ports.setdefault(host, []).append((ntype, nguid.lower() if nguid else None))
+    covered: set[str] = set()
+    for host, links in ports.items():
+        if any(nguid and nguid in visible_guids for _, nguid in links):
+            covered.add(host)
+        elif all(nguid and (ntype or "").upper() in ("FI", "HFI") and nguid in owned for ntype, nguid in links):
+            covered.add(host)
+    return covered
+
+
+def _discovery_vantages(
+    db: sqlite3.Connection, candidates: set[str], queried: set[str], covered: set[str], jobs: int
+) -> list[str]:
+    """Prefer a previously useful SA source, then bounded uncovered fallbacks."""
+    remaining = sorted(candidates - queried - covered)
+    if queried:
+        # Hosts cabled to the same switch share a fabric, so query one host per
+        # distinct neighbor switch first; this keeps SSH fan-out near one per fabric.
+        neighbors: dict[str, set[str]] = {}
+        for host, guid in db.execute("SELECT host, neighbor_guid FROM port WHERE kind='opa' AND state='ACTIVE'"):
+            if guid:
+                neighbors.setdefault(host, set()).add(guid.lower())
+        picked: list[str] = []
+        claimed: set[str] = set()
+        for host in remaining:
+            switches = neighbors.get(host, set())
+            if not switches or not switches & claimed:
+                picked.append(host)
+                claimed |= switches
+        return picked[:jobs]
+    prior_sources = [
+        source
+        for (source,) in db.execute(
+            "SELECT seen_from FROM fabric_node WHERE seen_from IS NOT NULL "
+            "GROUP BY seen_from ORDER BY count(*) DESC, seen_from"
+        )
+        if source in remaining
+    ]
+    return prior_sources[:1] or remaining[:1]
+
+
+def _cleanup_bogus_discovered_hosts(db: sqlite3.Connection) -> list[str]:
+    """Remove placeholder discoveries and discoveries whose FI GUID belongs elsewhere."""
+    owners = _port_guid_owners(db)
+    fabric_nodes = [
+        (guid.lower(), _fi_hostname(name))
+        for guid, name in db.execute("SELECT guid, name FROM fabric_node WHERE upper(type)='FI'")
+    ]
+    bogus: list[str] = []
+    for (host,) in db.execute("SELECT name FROM host WHERE source='discovered'"):
+        aliases = _name_aliases(host)
+        owned_elsewhere = any(
+            node_name in aliases and owners.get(guid, set()) - {host.lower()} for guid, node_name in fabric_nodes if node_name
+        )
+        if _is_unnamed_adapter(host) or owned_elsewhere:
+            bogus.append(host)
+
+    for host in bogus:
+        db.execute("DELETE FROM resource_host WHERE host=?", (host,))
+        db.execute("DELETE FROM adapter WHERE host=?", (host,))
+        db.execute("DELETE FROM port WHERE host=?", (host,))
+        db.execute("DELETE FROM host WHERE name=?", (host,))
+    if bogus:
+        db.commit()
+    return bogus
+
+
 def cmd_discover(db: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Discover unbooked hosts from read-only SA node records, then probe them."""
+    """Discover only unknown fabric hosts through coverage-aware, read-only SA queries."""
+    removed_hosts = _cleanup_bogus_discovered_hosts(db)
+    previously_discovered = db.execute("SELECT count(*) FROM host WHERE source='discovered'").fetchone()[0]
+    discovered_hosts: set[str] = set()
+    unnamed: dict[str, str | None] = {}
+    seen_fis: dict[str, dict] = {}
+    # Coverage must come from live SA answers only: seeding it from cached
+    # fabric_node rows would skip whole fabrics and miss newly cabled hosts.
+    visible_guids: set[str] = set()
+    observed_nodes: dict[str, dict] = {}
     queried: set[str] = set()
-    discovered_total = 0
-    for round_number in range(1, 6):
-        sources = [
-            host
-            for (host,) in db.execute(
-                "SELECT DISTINCT h.name FROM host h JOIN port p ON p.host=h.name "
-                "WHERE h.reachable=1 AND p.kind='opa' AND p.state='ACTIVE'"
-            )
-            if host not in queried
-        ]
+    covered: set[str] = set()
+    coverage_messages: list[tuple[int, int]] = []
+
+    # Keep querying until every active host is covered by some SA answer; the
+    # bound only guards against pathological loops, not normal multi-fabric labs.
+    for _ in range(50):
+        round_seen_fis: dict[str, dict] = {}
+        aliases = _known_host_aliases(db)
+        port_guids = _known_port_guids(db)
+        candidates = _active_discovery_hosts(db)
+        sources = _discovery_vantages(db, candidates, queried, covered, args.jobs)
         if not sources:
             break
         queried.update(sources)
-        print(f"Discovery round {round_number}: querying fabric SA from {len(sources)} hosts", file=sys.stderr)
-        results = run_parallel(lambda host: _sa_query(host, args.timeout), sources, args.jobs, "discover")
-        known = {host for (host,) in db.execute("SELECT name FROM host")}
-        new_hosts: set[str] = set()
-        for source, nodes in results:
+        for source, nodes in run_parallel(lambda host: _sa_query(host, args.timeout), sources, args.jobs, "discover"):
             for node in nodes:
                 db.execute(
                     "INSERT OR REPLACE INTO fabric_node VALUES (?,?,?,?,?,?,datetime('now'))",
                     (node["guid"], node["type"], node["name"], node.get("vendor"), node.get("device"), source),
                 )
-                hostname = _fi_hostname(node["name"]) if node["type"] == "FI" else None
-                if hostname and hostname not in known:
-                    new_hosts.add(hostname)
+                visible_guids.add(node["guid"].lower())
+                observed_nodes[node["guid"].lower()] = node
+                if node["type"].upper() == "FI":
+                    seen_fis[node["guid"].lower()] = node
+                    round_seen_fis[node["guid"].lower()] = node
+        covered = {host for host, guids in port_guids.items() if guids & visible_guids}
+        # A host is also on an already-answered fabric when its neighbor switch
+        # appeared in an SA reply, and a host whose every active port is cabled
+        # directly to another known host cannot lead to anything unknown.
+        covered |= _fabric_covered_hosts(db, visible_guids)
+        coverage_messages.append((len(sources), len(covered)))
+
+        guid_owners = _guid_owner(db)
+        new_hosts: set[str] = set()
+        for node in round_seen_fis.values():
+            guid = node["guid"].lower()
+            hostname = _fi_hostname(node["name"])
+            owner = guid_owners.get(guid)
+            is_known = owner is not None or (hostname in aliases if hostname else False)
+            if _is_unnamed_adapter(node["name"]):
+                unnamed[guid] = owner
+            elif hostname and not is_known and hostname not in discovered_hosts:
+                new_hosts.add(hostname)
+
         for host in new_hosts:
             db.execute("INSERT OR IGNORE INTO host(name, source) VALUES (?, 'discovered')", (host,))
         db.commit()
-        suffix = f": {', '.join(sorted(new_hosts))}" if new_hosts else ""
-        print(f"  found {len(new_hosts)} new host(s) not in Booked{suffix}", file=sys.stderr)
         if not new_hosts:
-            break
-        discovered_total += len(new_hosts)
+            continue  # other fabrics may still be uncovered
+        discovered_hosts.update(new_hosts)
         _probe_hosts(db, sorted(new_hosts), args, show_progress=True)
-    switch_count = db.execute("SELECT count(*) FROM fabric_node WHERE type='SW'").fetchone()[0]
-    print(f"Discovery complete: {discovered_total} new host(s), {switch_count} switch(es) recorded")
+
+    cached_nodes = {
+        guid.lower(): {"guid": guid, "type": node_type, "name": name}
+        for guid, node_type, name in db.execute("SELECT guid, type, name FROM fabric_node")
+    }
+    cached_nodes.update(observed_nodes)
+    seen_fis = {
+        guid: node
+        for guid, node in cached_nodes.items()
+        if node["type"].upper() == "FI"
+    }
+    total_queries = sum(queried_count for queried_count, _ in coverage_messages)
+    total_covered = coverage_messages[-1][1] if coverage_messages else 0
+    print(
+        f"Querying fabric SA from {total_queries} vantage host(s) (covering {total_covered} known hosts)",
+        file=sys.stderr,
+    )
+
+    known_fis = sum(
+        _guid_owner(db).get(guid) is not None or (_fi_hostname(node["name"]) in _known_host_aliases(db))
+        for guid, node in seen_fis.items()
+    )
+    switch_count = db.execute("SELECT count(*) FROM fabric_node WHERE upper(type)='SW'").fetchone()[0]
+    suffix = f": {', '.join(sorted(discovered_hosts))}" if discovered_hosts else ""
+    print(f"Fabric: {len(seen_fis)} adapters seen, {known_fis} belong to known hosts, {len(discovered_hosts)} new host(s){suffix}")
+    if unnamed:
+        adapters = ", ".join(f"{guid} ({owner})" if owner else guid for guid, owner in sorted(unnamed.items()))
+        print(f"Unnamed adapters: {adapters}")
+    print(f"Switches: {switch_count}")
+    if previously_discovered:
+        print(f"Previously discovered hosts: {previously_discovered}")
+    if removed_hosts:
+        print(f"Removed bogus discovered hosts: {', '.join(sorted(removed_hosts))}", file=sys.stderr)
     return 0
 
 
@@ -790,9 +972,17 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
 
 
 def _guid_owner(db: sqlite3.Connection) -> dict[str, str]:
-    """Map both sysfs and SMA node GUID forms to their locally probed host port."""
-    owners = {guid: f"{host}:{interface}" for guid, host, interface in db.execute("SELECT node_guid, host, ifname FROM port WHERE node_guid IS NOT NULL")}
-    owners.update({guid: f"{host}:{interface}" for guid, host, interface in db.execute("SELECT port_guid, host, ifname FROM port WHERE port_guid IS NOT NULL")})
+    """Map case-insensitive sysfs and SMA GUID forms to their local host port."""
+    owners = {
+        guid.lower(): f"{host}:{interface}"
+        for guid, host, interface in db.execute("SELECT node_guid, host, ifname FROM port WHERE node_guid IS NOT NULL")
+    }
+    owners.update(
+        {
+            guid.lower(): f"{host}:{interface}"
+            for guid, host, interface in db.execute("SELECT port_guid, host, ifname FROM port WHERE port_guid IS NOT NULL")
+        }
+    )
     return owners
 
 
