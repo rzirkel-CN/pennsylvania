@@ -290,6 +290,26 @@ opasmaquery: failed to open port: Device or resource busy
                 self.assertEqual(code, 0)
                 self.assertIsInstance(json.loads(text), dict)
 
+    def test_flat_output_formats_for_list_and_links(self) -> None:
+        import csv as _csv, io as _io
+        self.add_host("flat01", model="Dell R7625")
+        self.add_adapter("flat01", "0000:01:00.0", "CN5000")
+        self.add_resource(1, "Flat rack", ["flat01"])
+        code, text, _ = self.run_cli("list", "--format", "csv")
+        self.assertEqual(code, 0)
+        rows = list(_csv.DictReader(_io.StringIO(text)))
+        self.assertEqual(rows[0]["host"], "flat01")
+        self.assertEqual(rows[0]["generation"], "CN5000")
+        self.assertEqual(rows[0]["resources"], "Flat rack")
+        code, text, _ = self.run_cli("ls", "-o", "tsv")
+        self.assertEqual(text.splitlines()[0].split("\t")[0], "host")
+        self.assertEqual(text.splitlines()[1].split("\t")[0], "flat01")
+        code, text, _ = self.run_cli("list", "-o", "jsonl")
+        self.assertEqual([json.loads(line)["host"] for line in text.splitlines()], ["flat01"])
+        code, text, _ = self.run_cli("links", "-o", "csv")
+        self.assertEqual(code, 0)
+        self.assertTrue(text.startswith("host,") or text.strip() == "")
+
     def test_color_is_disabled_for_non_tty_and_when_no_color_is_set(self) -> None:
         self.add_host("color01")
         self.add_adapter("color01", "0000:01:00.0", "CN5000")

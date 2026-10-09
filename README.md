@@ -32,6 +32,7 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 # Inspect the cache. `ls` and `list` are interchangeable.
 ./cnhwinv ls --gen 6k --reachable -w
 ./cnhwinv list --source discovered --json
+./cnhwinv ls --gen 5k -o csv > cn5000.csv   # also: -o tsv | jsonl | json
 
 # Host names are case-insensitive and support a unique partial match.
 # A Booked resource name lists all its assigned hosts.
@@ -45,7 +46,8 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 Generation accepts `5k`, `6k`, `5000`, `6000`, `CN5000`, and `CN6000`
 case-insensitively. Human-facing output uses color only on a terminal; set
 `NO_COLOR=1` or pass `--no-color` to disable it. Use `--json` with `status`,
-`list`, `show`, or `links` for scripts. Use `--debug` only when you need a
+`list`, `show`, or `links` for scripts; `list` and `links` also accept
+`--format/-o` `csv`, `tsv`, `jsonl` (one record per line), or `json`. Use `--debug` only when you need a
 traceback for an unexpected failure.
 
 ## Tests

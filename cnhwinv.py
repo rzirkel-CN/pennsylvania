@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import difflib
+import csv
 import json
 import os
 import re
@@ -853,6 +854,42 @@ def _json(payload: dict) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+TABLE_FORMATS = ("table", "json", "jsonl", "csv", "tsv")
+
+
+def _output_format(args: argparse.Namespace) -> str:
+    """--json is kept as a shorthand for --format json."""
+    return "json" if getattr(args, "json", False) else getattr(args, "format", "table")
+
+
+def _cell(value: object) -> str:
+    """Flatten one value into a single spreadsheet/awk-friendly cell."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, list):
+        return ";".join(_cell(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def _emit_records(records: list[dict], fmt: str) -> None:
+    """Write one record per line (jsonl) or per row with a header (csv/tsv)."""
+    if fmt == "jsonl":
+        for record in records:
+            print(json.dumps(record, sort_keys=True))
+        return
+    columns: list[str] = []
+    for record in records:
+        columns += [key for key in record if key not in columns]
+    writer = csv.writer(sys.stdout, delimiter="\t" if fmt == "tsv" else ",", lineterminator="\n")
+    writer.writerow(columns)
+    for record in records:
+        writer.writerow([_cell(record.get(column)) for column in columns])
+
+
 def cmd_status(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Show cache coverage and age without contacting Booked or SSH."""
     status = _status_data(db, args.db)
@@ -950,8 +987,12 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     entries, summary = _list_entries(db, args)
     resource_count, synced_at = db.execute("SELECT count(*), max(synced_at) FROM resource").fetchone()
     hint = _cache_hint(resource_count, synced_at)
-    if args.json:
+    fmt = _output_format(args)
+    if fmt == "json":
         _json({"hosts": entries, "summary": summary, "hint": hint})
+        return 0
+    if fmt != "table":
+        _emit_records(entries, fmt)
         return 0
 
     wide = args.wide or args.model or args.cpu or args.os
@@ -1199,8 +1240,13 @@ def cmd_links(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     where, params = ("a.generation=?", (args.gen,)) if args.gen else ("1=1", ())
     links = _link_records(db, where, params)
     groups = _fabric_groups(db)
-    if args.json:
+    fmt = _output_format(args)
+    if fmt == "json":
         _json({"links": links, "fabrics": groups})
+        return 0
+    if fmt != "table":
+        # Flat formats carry the per-port link records; fabric groups are derived from them.
+        _emit_records(links, fmt)
         return 0
     for link in links:
         print(f"  {link['local']:<34} {link['generation'] or '?':<7} {link['state'] or '?':<7} -> {link['peer']}")
@@ -1307,7 +1353,7 @@ def build_parser() -> argparse.ArgumentParser:
         "list",
         aliases=["ls"],
         help_text="List cached hosts; use filters without contacting Booked or SSH.",
-        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --source discovered --json",
+        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --source discovered --json\n  cnhwinv ls --gen 5k -o csv > cn5000.csv\n  cnhwinv ls -o tsv | awk -F'\\t' '$3==\"yes\"{print $1}'",
     )
     listing.add_argument("--gen", type=_generation_argument, metavar="GEN", help="5k/6k/CN5000/CN6000, mixed, none, or unprobed")
     listing.add_argument("--reachable", action="store_true", help="only latest probes that were reachable")
@@ -1316,7 +1362,8 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--cpu", help="filter CPU model substring (case-insensitive)")
     listing.add_argument("--os", help="filter OS substring (case-insensitive)")
     listing.add_argument("--source", choices=["booked", "discovered"], help="filter Booked or fabric-discovered hosts")
-    listing.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    listing.add_argument("--json", action="store_true", help="shorthand for --format json")
+    listing.add_argument("--format", "-o", choices=TABLE_FORMATS, default="table", help="output format: table (default), json, jsonl, csv, or tsv")
 
     show = _subparser(
         subparsers,
@@ -1331,10 +1378,11 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers,
         "links",
         help_text="Show cached fabric and Ethernet neighbor evidence.",
-        examples="cnhwinv links\n  cnhwinv links --gen CN6000 --json",
+        examples="cnhwinv links\n  cnhwinv links --gen CN6000 --json\n  cnhwinv links -o csv",
     )
     links.add_argument("--gen", type=_link_generation_argument, metavar="GEN", help="5k/6k/CN5000, or CN6000")
-    links.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    links.add_argument("--json", action="store_true", help="shorthand for --format json")
+    links.add_argument("--format", "-o", choices=TABLE_FORMATS, default="table", help="output format: table (default), json, jsonl, csv, or tsv")
     return parser
 
 
