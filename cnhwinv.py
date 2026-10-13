@@ -694,6 +694,14 @@ def _cleanup_bogus_discovered_hosts(db: sqlite3.Connection) -> list[str]:
 
 def cmd_discover(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Discover only unknown fabric hosts through coverage-aware, read-only SA queries."""
+    # Discovery needs SA vantage points, which only exist once hosts are probed;
+    # a fresh cache (sync-booked only) would otherwise silently report zeros.
+    if not _active_discovery_hosts(db):
+        probed = db.execute("SELECT count(*) FROM host WHERE probed_at IS NOT NULL").fetchone()[0]
+        why = "no hosts have been probed yet" if not probed else "no probed host has an active Cornelis fabric port"
+        print(f"Nothing to discover from: {why}.", file=sys.stderr)
+        print("Hint: run 'cnhwinv probe' (or 'cnhwinv update --discover') first; discovery queries the fabric SA from probed hosts.", file=sys.stderr)
+        return 1
     removed_hosts = _cleanup_bogus_discovered_hosts(db)
     previously_discovered = db.execute("SELECT count(*) FROM host WHERE source='discovered'").fetchone()[0]
     discovered_hosts: set[str] = set()
@@ -987,6 +995,14 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     entries, summary = _list_entries(db, args)
     resource_count, synced_at = db.execute("SELECT count(*), max(synced_at) FROM resource").fetchone()
     hint = _cache_hint(resource_count, synced_at)
+    # Model/CPU/OS/generation come from SSH probes, so filtering an unprobed
+    # cache returns nothing; say so instead of an unexplained empty table.
+    probe_filters = args.model or args.cpu or args.os or (args.gen and args.gen.lower() != "unprobed")
+    if not hint and probe_filters:
+        unprobed = db.execute("SELECT count(*) FROM host WHERE probed_at IS NULL").fetchone()[0]
+        if unprobed:
+            hint = (f"{unprobed} host(s) have not been probed, so their model/CPU/OS/generation are unknown "
+                    "and they cannot match these filters. Run 'cnhwinv probe' (or 'cnhwinv update') first.")
     fmt = _output_format(args)
     if fmt == "json":
         _json({"hosts": entries, "summary": summary, "hint": hint})

@@ -396,6 +396,26 @@ opasmaquery: failed to open port: Device or resource busy
         )
         self.db.commit()
 
+    def test_discover_on_unprobed_cache_explains_probe_is_needed(self) -> None:
+        self.db.execute("INSERT INTO host(name, source) VALUES ('fresh01', 'booked')")
+        self.db.commit()
+        with mock.patch.object(bi, "_sa_query") as query:
+            code, stdout, stderr = self.run_cli("discover")
+        self.assertEqual(code, 1)
+        query.assert_not_called()
+        self.assertIn("no hosts have been probed yet", stderr)
+        self.assertIn("cnhwinv probe", stderr)
+
+    def test_list_filter_on_unprobed_hosts_hints_to_probe(self) -> None:
+        self.db.execute("INSERT INTO resource(id, name, synced_at) VALUES (1, 'r', datetime('now'))")
+        self.db.execute("INSERT INTO host(name, source) VALUES ('fresh01', 'booked')")
+        self.db.commit()
+        code, stdout, _ = self.run_cli("list", "--model", "sr655")
+        self.assertEqual(code, 0)
+        self.assertIn("1 host(s) have not been probed", stdout)
+        code, stdout, _ = self.run_cli("list")
+        self.assertNotIn("have not been probed", stdout)
+
     def test_discover_queries_one_vantage_when_its_sa_results_cover_other_hosts(self) -> None:
         self.add_host("vantage01")
         self.add_host("zcovered02")
