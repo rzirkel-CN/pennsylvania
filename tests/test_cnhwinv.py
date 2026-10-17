@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -98,10 +99,21 @@ class InventoryTestCase(unittest.TestCase):
         )
         self.db.commit()
 
-    def add_resource(self, resource_id: int, name: str, hosts: list[str]) -> None:
+    def add_resource(
+        self,
+        resource_id: int,
+        name: str,
+        hosts: list[str],
+        *,
+        avail_state: str = "free",
+        avail_until: str | None = None,
+        avail_at: str | None = None,
+        reserved_by: str | None = None,
+    ) -> None:
         self.db.execute(
-            "INSERT INTO resource(id, name, synced_at) VALUES (?, ?, datetime('now'))",
-            (resource_id, name),
+            "INSERT INTO resource(id, name, synced_at, avail_state, avail_until, avail_at, reserved_by, avail_checked_at) "
+            "VALUES (?, ?, datetime('now'), ?, ?, ?, ?, datetime('now'))",
+            (resource_id, name, avail_state, avail_until, avail_at, reserved_by),
         )
         self.db.executemany(
             "INSERT INTO resource_host(resource_id, host) VALUES (?, ?)",
@@ -206,6 +218,200 @@ opasmaquery: failed to open port: Device or resource busy
         self.assertIn("sixk01", text)
         self.assertNotIn("offline01", text)
         self.assertIn("1 host (0 CN5000, 1 CN6000", text)
+
+    def test_sync_booked_populates_cached_availability(self) -> None:
+        resources = [
+            {
+                "resourceId": 1,
+                "name": "Sync rack",
+                "statusId": 1,
+                "customAttributes": [{"id": 2, "label": "Hosts", "value": "sync01"}],
+            }
+        ]
+        availability = {
+            "resources": [
+                [
+                    {
+                        "available": False,
+                        "availableAt": "2026-10-17T15:30:00-0600",
+                        "availableUntil": "2026-10-17T14:30:00-0600",
+                        "resource": {"resourceId": "1", "statusId": "1"},
+                    }
+                ]
+            ]
+        }
+
+        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(
+            bi, "_call", side_effect=lambda path, **_: {"resources": resources} if path == "/Resources/" else availability
+        ):
+            session.return_value.__enter__.return_value = {"X-Booked-SessionToken": "token"}
+            bi.cmd_sync_booked(self.db, argparse.Namespace())
+
+        row = self.db.execute("SELECT avail_state, avail_at FROM resource WHERE id=1").fetchone()
+        self.assertEqual(tuple(row), ("reserved", "2026-10-17T15:30:00-0600"))
+        self.assertEqual(self.db.execute("SELECT host FROM resource_host WHERE resource_id=1").fetchone()[0], "sync01")
+
+    def test_list_booked_column_summarizes_multiple_resources_and_available_filter(self) -> None:
+        self.add_host("free01")
+        self.add_host("busy01")
+        self.add_host("mixed01")
+        self.add_host("discovered01", source="discovered")
+        self.add_resource(1, "Free rack", ["free01", "mixed01"])
+        self.add_resource(2, "Busy rack", ["busy01", "mixed01"], avail_state="reserved", avail_at="2026-10-17T15:30:00-0600", reserved_by="Ada Lovelace")
+
+        code, text, _ = self.run_cli("list", "--offline", "--wide")
+
+        self.assertEqual(code, 0)
+        self.assertIn("BOOKED", text)
+        self.assertIn("free01", text)
+        self.assertIn("free", text)
+        self.assertIn("busy01", text)
+        self.assertIn("in use until 15:30 by Ada Lovelace", text)
+        self.assertIn("mixed01", text)
+        self.assertIn("in use until 15:30 by Ada Lovelace", text)
+        self.assertIn("discovered01", text)
+        self.assertIn("-", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "--available")
+
+        self.assertEqual(code, 0)
+        self.assertIn("free01", text)
+        self.assertNotIn("busy01", text)
+        self.assertNotIn("mixed01", text)
+        self.assertNotIn("discovered01", text)
+
+    def test_refresh_availability_uses_batched_gets_and_reservation_owner(self) -> None:
+        self.add_host("refresh01")
+        self.add_resource(1, "Refresh rack", ["refresh01"])
+        responses = [
+            {
+                "resources": [
+                    [
+                        {
+                            "available": False,
+                            "availableAt": "2026-10-17T15:30:00-0600",
+                            "availableUntil": "2026-10-17T14:30:00-0600",
+                            "resource": {"resourceId": "1", "statusId": "1"},
+                        }
+                    ]
+                ]
+            },
+            {
+                "reservations": [
+                    {
+                        "resourceId": "1",
+                        "startDate": "2026-10-17T12:30:00-0600",
+                        "endDate": "2026-10-17T15:30:00-0600",
+                        "firstName": "Ada",
+                        "lastName": "Lovelace",
+                    }
+                ]
+            },
+        ]
+
+        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(bi, "_call", side_effect=responses) as call, mock.patch.object(
+            bi, "datetime"
+        ) as clock:
+            session.return_value.__enter__.return_value = {"X-Booked-SessionToken": "token"}
+            clock.now.return_value = datetime(2026, 10, 17, 20, 0, tzinfo=timezone.utc)
+            clock.fromisoformat.side_effect = datetime.fromisoformat
+            bi.refresh_availability(self.db)
+
+        self.assertEqual(call.call_count, 2)
+        state, until, owner = self.db.execute("SELECT avail_state, avail_at, reserved_by FROM resource WHERE id=1").fetchone()
+        self.assertEqual((state, until, owner), ("reserved", "2026-10-17T15:30:00-0600", "Ada Lovelace"))
+
+    def test_refresh_availability_falls_back_to_current_reservations_when_needed(self) -> None:
+        self.add_host("fallback01")
+        self.add_resource(1, "Fallback rack", ["fallback01"], avail_state="free")
+        responses = [
+            {},
+            {
+                "reservations": [
+                    {
+                        "resourceId": "1",
+                        "startDate": "2026-10-17T12:30:00-0600",
+                        "endDate": "2026-10-17T15:30:00-0600",
+                        "firstName": "Ada",
+                        "lastName": "Lovelace",
+                    }
+                ]
+            },
+        ]
+
+        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(bi, "_call", side_effect=responses) as call, mock.patch.object(
+            bi, "datetime"
+        ) as clock:
+            session.return_value.__enter__.return_value = {"X-Booked-SessionToken": "token"}
+            clock.now.return_value = datetime(2026, 10, 17, 20, 0, tzinfo=timezone.utc)
+            clock.fromisoformat.side_effect = datetime.fromisoformat
+            bi.refresh_availability(self.db)
+
+        self.assertEqual(call.call_count, 2)
+        state, owner = self.db.execute("SELECT avail_state, reserved_by FROM resource WHERE id=1").fetchone()
+        self.assertEqual((state, owner), ("reserved", "Ada Lovelace"))
+
+    def test_list_offline_skips_availability_refresh_and_falls_back_after_failure(self) -> None:
+        self.add_host("cached01")
+        self.add_resource(1, "Cached rack", ["cached01"], avail_state="free")
+        self.db.execute("UPDATE resource SET avail_checked_at=datetime('now', '-10 minutes')")
+        self.db.commit()
+
+        with mock.patch.object(bi, "refresh_availability") as refresh:
+            code, text, error = self.run_cli("list", "--offline")
+        self.assertEqual(code, 0)
+        self.assertEqual(error, "")
+        refresh.assert_not_called()
+        self.assertIn("cached01", text)
+
+        with mock.patch.object(bi, "refresh_availability", side_effect=bi.UserError("offline")):
+            code, text, error = self.run_cli("list")
+        self.assertEqual(code, 0)
+        self.assertIn("cached01", text)
+        self.assertIn("Warning: Booked availability refresh failed; using cached values", error)
+
+    def test_list_structured_output_includes_booked_fields(self) -> None:
+        self.add_host("structured01")
+        self.add_resource(
+            1,
+            "Structured rack",
+            ["structured01"],
+            avail_state="reserved",
+            avail_at="2026-10-17T15:30:00-0600",
+            reserved_by="Ada Lovelace",
+        )
+
+        code, text, _ = self.run_cli("list", "--offline", "--json")
+
+        self.assertEqual(code, 0)
+        entry = json.loads(text)["hosts"][0]
+        self.assertEqual(entry["booked_status"], "in use")
+        self.assertEqual(entry["booked_until"], "2026-10-17T15:30:00-0600")
+        self.assertEqual(entry["booked_by"], "Ada Lovelace")
+
+        code, text, _ = self.run_cli("list", "--offline", "-o", "csv")
+
+        self.assertEqual(code, 0)
+        row = next(__import__("csv").DictReader(io.StringIO(text)))
+        self.assertEqual(row["booked_status"], "in use")
+        self.assertEqual(row["booked_until"], "2026-10-17T15:30:00-0600")
+        self.assertEqual(row["booked_by"], "Ada Lovelace")
+
+    def test_open_db_migrates_old_resource_table_with_availability_columns(self) -> None:
+        self.db.close()
+        self.db_path.unlink()
+        old = sqlite3.connect(self.db_path)
+        old.executescript(
+            "CREATE TABLE resource (id INTEGER PRIMARY KEY, name TEXT, schedule_id INTEGER, status_id INTEGER, "
+            "description TEXT, notes TEXT, hosts_raw TEXT, attrs_json TEXT, synced_at TEXT);"
+        )
+        old.commit()
+        old.close()
+
+        self.db = bi.open_db(self.db_path)
+
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(resource)")}
+        self.assertTrue({"avail_state", "avail_until", "avail_at", "reserved_by", "avail_checked_at"}.issubset(columns))
 
     def test_list_alias_wide_and_source_filter_remain_backward_compatible(self) -> None:
         self.add_host("discovered01", source="discovered")
@@ -369,7 +575,7 @@ opasmaquery: failed to open port: Device or resource busy
             ["refresh", "--jobs", "2"],
             ["discover", "--jobs", "2", "--timeout", "5"],
             ["status"],
-            ["list", "--gen", "5000", "--reachable", "--wide", "--model", "SR655", "--cpu", "EPYC", "--os", "Rocky", "--source", "booked"],
+            ["list", "--gen", "5000", "--reachable", "--wide", "--model", "SR655", "--cpu", "EPYC", "--os", "Rocky", "--source", "booked", "--available", "--offline"],
             ["ls", "--gen", "CN6000"],
             ["show", "host01"],
             ["links", "--gen", "6000"],

@@ -5,15 +5,17 @@
 Inventories Cornelis lab hosts from Booked Scheduler, fabric discovery, and
 read-only SSH probes.
 
-The SQLite cache is the reporting source of truth: `list`, `show`, `links`, and
-`status` never contact Booked or any lab host. Use `update` to refresh it.
+The SQLite cache is the reporting source of truth. `list` may perform one
+read-only Booked availability refresh when its cached value is stale; all other
+reporting commands remain offline. Use `update` to refresh full inventory data.
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
-import difflib
+from contextlib import contextmanager
 import csv
+import difflib
 import json
 import os
 import re
@@ -23,10 +25,11 @@ import subprocess
 import sys
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 VERSION = "1.0.0"
 BOOKED_API = "http://booked.cornelisnetworks.com/Web/Services/index.php"
@@ -44,7 +47,9 @@ CREATE TABLE IF NOT EXISTS fabric_node (
   seen_from TEXT, seen_at TEXT);
 CREATE TABLE IF NOT EXISTS resource (
   id INTEGER PRIMARY KEY, name TEXT, schedule_id INTEGER, status_id INTEGER,
-  description TEXT, notes TEXT, hosts_raw TEXT, attrs_json TEXT, synced_at TEXT);
+  description TEXT, notes TEXT, hosts_raw TEXT, attrs_json TEXT, synced_at TEXT,
+  avail_state TEXT, avail_until TEXT, avail_at TEXT, reserved_by TEXT,
+  avail_checked_at TEXT);
 CREATE TABLE IF NOT EXISTS host (
   name TEXT PRIMARY KEY, probed_at TEXT, reachable INTEGER, error TEXT, fqdn TEXT,
   source TEXT DEFAULT 'booked', model TEXT, cpu TEXT, sockets TEXT, cores TEXT,
@@ -64,12 +69,14 @@ CREATE TABLE IF NOT EXISTS port (
 
 TOP_DESCRIPTION = """Inspect the local Booked Scheduler inventory cache without touching lab hosts.
 
-`update` is the only convenience command that contacts Booked and SSH-probes
-hosts. Remote probes and discovery are strictly read-only."""
+`update` refreshes Booked metadata and SSH-probes hosts. `list` refreshes only
+cached Booked availability when it is older than five minutes; use `--offline`
+to suppress that read-only refresh. Remote probes and discovery are strictly read-only."""
 TOP_EPILOG = """Common examples:
   cnhwinv status
   cnhwinv update --max-age 24
   cnhwinv ls --gen 6k --reachable -w
+  cnhwinv list --available
   cnhwinv show cn123
   cnhwinv links --gen CN5000
   cnhwinv --db /tmp/inventory.db list --json
@@ -151,17 +158,112 @@ def _call(path: str, data: dict[str, str] | None = None, headers: dict[str, str]
         raise UserError("Booked Scheduler is unreachable or returned an invalid response. Check VPN/network access.") from error
 
 
-def booked_resources() -> list[dict]:
-    """Authenticate to Booked, return resources, then invalidate its session."""
+@contextmanager
+def _booked_session() -> Iterator[dict[str, str]]:
+    """Authenticate once for a bounded group of read-only Booked API calls."""
     user, password = _creds()
     auth = _call("/Authentication/Authenticate", {"username": user, "password": password})
     if not auth.get("isAuthenticated"):
         raise UserError("Booked authentication failed. Check the configured credentials.")
     headers = {"X-Booked-SessionToken": auth["sessionToken"], "X-Booked-UserId": str(auth["userId"])}
     try:
-        return _call("/Resources/", headers=headers)["resources"]
+        yield headers
     finally:
         _call("/Authentication/SignOut", {"userId": auth["userId"], "sessionToken": auth["sessionToken"]})
+
+
+def booked_resources() -> list[dict]:
+    """Authenticate to Booked, return resources, then invalidate its session."""
+    with _booked_session() as headers:
+        return _call("/Resources/", headers=headers)["resources"]
+
+
+def _availability_entries(payload: dict) -> list[dict]:
+    """Flatten Booked's schedule-grouped availability payload into resource entries."""
+    return [entry for group in payload.get("resources") or [] for entry in group]
+
+
+def _booked_datetime(value: str | None) -> datetime | None:
+    """Parse a Booked timestamp, retaining its server-provided timezone offset."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def _reservation_owners(payload: dict, now: datetime) -> dict[str, str | None]:
+    """Map reservations covering now to their optional Booked user display names."""
+    owners: dict[str, str | None] = {}
+    for reservation in payload.get("reservations") or []:
+        start = _booked_datetime(reservation.get("startDate"))
+        end = _booked_datetime(reservation.get("endDate"))
+        resource_id = reservation.get("resourceId")
+        if resource_id is None or start is None or end is None or not start <= now <= end:
+            continue
+        owner = " ".join(part for part in (reservation.get("firstName"), reservation.get("lastName")) if part) or None
+        owners[str(resource_id)] = owner
+    return owners
+
+
+def _availability_state(status_id: str | int | None, available: bool) -> str:
+    """Translate Booked resource status plus calendar availability into one cache state."""
+    if str(status_id) in {"0", "2"}:
+        return "unavailable"
+    return "free" if available else "reserved"
+
+
+def _fallback_availability(db: sqlite3.Connection, payload: dict, now: datetime) -> None:
+    """Update availability from current reservations if the availability endpoint is absent."""
+    owners = _reservation_owners(payload, now)
+    for resource_id, status_id in db.execute("SELECT id, status_id FROM resource"):
+        state = "unavailable" if str(status_id) in {"0", "2"} else ("reserved" if str(resource_id) in owners else "free")
+        db.execute(
+            "UPDATE resource SET avail_state=?, avail_until=NULL, avail_at=NULL, reserved_by=?, avail_checked_at=datetime('now') WHERE id=?",
+            (state, owners.get(str(resource_id)), resource_id),
+        )
+
+
+def refresh_availability(db: sqlite3.Connection) -> None:
+    """Refresh all Booked resource availability with one or two read-only GET requests."""
+    now = datetime.now(timezone.utc)
+    query = urllib.parse.quote(now.isoformat())
+    with _booked_session() as headers:
+        payload = _call("/Resources/Availability", headers=headers)
+        if "resources" not in payload:
+            reservations = _call(f"/Reservations/?startDateTime={query}&endDateTime={query}", headers=headers)
+            _fallback_availability(db, reservations, now)
+        else:
+            entries = _availability_entries(payload)
+            reserved = {
+                str(entry.get("resource", {}).get("resourceId"))
+                for entry in entries
+                if entry.get("resource", {}).get("resourceId") is not None
+                and _availability_state(entry.get("resource", {}).get("statusId"), bool(entry.get("available"))) == "reserved"
+            }
+            owners: dict[str, str | None] = {}
+            if reserved:
+                reservations = _call(f"/Reservations/?startDateTime={query}&endDateTime={query}", headers=headers)
+                owners = _reservation_owners(reservations, now)
+            for entry in entries:
+                resource = entry.get("resource") or {}
+                resource_id = resource.get("resourceId")
+                if resource_id is None:
+                    continue
+                state = _availability_state(resource.get("statusId"), bool(entry.get("available")))
+                db.execute(
+                    "UPDATE resource SET avail_state=?, avail_until=?, avail_at=?, reserved_by=?, avail_checked_at=datetime('now') WHERE id=?",
+                    (
+                        state,
+                        entry.get("availableUntil"),
+                        entry.get("availableAt"),
+                        owners.get(str(resource_id)) if state == "reserved" else None,
+                        resource_id,
+                    ),
+                )
+    db.commit()
 
 
 def cmd_sync_booked(db: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -180,7 +282,9 @@ def cmd_sync_booked(db: sqlite3.Connection, args: argparse.Namespace) -> int:
             "",
         )
         db.execute(
-            "INSERT OR REPLACE INTO resource VALUES (?,?,?,?,?,?,?,?,datetime('now'))",
+            "INSERT OR REPLACE INTO resource "
+            "(id, name, schedule_id, status_id, description, notes, hosts_raw, attrs_json, synced_at) "
+            "VALUES (?,?,?,?,?,?,?,?,datetime('now'))",
             (
                 resource["resourceId"],
                 resource["name"],
@@ -197,6 +301,7 @@ def cmd_sync_booked(db: sqlite3.Connection, args: argparse.Namespace) -> int:
             # A formerly discovered host is authoritative Booked inventory once it appears here.
             db.execute("INSERT INTO host(name, source) VALUES (?, 'booked') ON CONFLICT(name) DO UPDATE SET source='booked'", (host,))
     db.commit()
+    refresh_availability(db)
     host_count = db.execute("SELECT count(DISTINCT host) FROM resource_host").fetchone()[0]
     print(f"Synced {len(resources)} resources, {host_count} hosts")
     return 0
@@ -930,6 +1035,43 @@ def _short(value: str | None, length: int) -> str:
     return cleaned if len(cleaned) <= length else cleaned[: length - 1] + "~"
 
 
+def _availability_is_stale(db: sqlite3.Connection) -> bool:
+    """Return whether Booked availability is absent or older than the five-minute cache window."""
+    resource_count, checked_at = db.execute("SELECT count(*), min(avail_checked_at) FROM resource").fetchone()
+    if not resource_count or not checked_at:
+        return bool(resource_count)
+    try:
+        checked = datetime.strptime(checked_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - checked).total_seconds() > 300
+
+
+def _booked_summary(resources: list[dict]) -> tuple[str, str | None, str | None]:
+    """Reduce zero or more mapped resource states to one host-facing Booked status."""
+    if not resources:
+        return "-", None, None
+    states = {resource.get("avail_state") for resource in resources}
+    if states == {"free"}:
+        return "free", None, None
+    unavailable = [resource for resource in resources if resource.get("avail_state") == "unavailable"]
+    if unavailable:
+        return "unavailable", None, None
+    reserved = [resource for resource in resources if resource.get("avail_state") == "reserved"]
+    until = min((resource.get("avail_at") for resource in reserved if resource.get("avail_at")), default=None)
+    owners = sorted({resource.get("reserved_by") for resource in reserved if resource.get("reserved_by")})
+    return "in use", until, ", ".join(owners) or None
+
+
+def _booked_cell(status: str, until: str | None, owner: str | None, wide: bool) -> str:
+    """Format the human-facing Booked status without losing structured timestamp fields."""
+    if status != "in use" or not wide:
+        return status
+    time = _booked_datetime(until)
+    suffix = f" until {time.strftime('%H:%M')}" if time else ""
+    return f"in use{suffix}" + (f" by {owner}" if owner else "")
+
+
 def _normalise_generation(value: str, allow_controls: bool = True) -> str:
     """Accept familiar generation spellings while retaining canonical cached labels."""
     key = value.strip().lower().replace("-", "")
@@ -945,19 +1087,52 @@ def _normalise_generation(value: str, allow_controls: bool = True) -> str:
 def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[list[dict], dict]:
     """Apply reporting filters once and return both rows and a useful summary."""
     rows = db.execute(
-        "SELECT h.name, h.reachable, h.probed_at, group_concat(DISTINCT r.name), h.source, h.model, h.cpu, h.os "
+        "SELECT h.name, h.reachable, h.probed_at, h.source, h.model, h.cpu, h.os, r.name, "
+        "r.avail_state, r.avail_until, r.avail_at, r.reserved_by "
         "FROM host h LEFT JOIN resource_host rh ON rh.host=h.name "
-        "LEFT JOIN resource r ON r.id=rh.resource_id GROUP BY h.name ORDER BY h.name"
+        "LEFT JOIN resource r ON r.id=rh.resource_id ORDER BY h.name, r.name"
     ).fetchall()
+    hosts: dict[str, dict] = {}
+    for name, reachable, probed_at, source, model, cpu, os_name, resource_name, avail_state, avail_until, avail_at, reserved_by in rows:
+        entry = hosts.setdefault(
+            name,
+            {
+                "host": name,
+                "reachable": bool(reachable) if probed_at else None,
+                "probed_at": probed_at,
+                "source": source or "booked",
+                "resources": [],
+                "model": model,
+                "cpu": cpu,
+                "os": os_name,
+            },
+        )
+        if resource_name:
+            entry["resources"].append(
+                {
+                    "name": resource_name,
+                    "avail_state": avail_state,
+                    "avail_until": avail_until,
+                    "avail_at": avail_at,
+                    "reserved_by": reserved_by,
+                }
+            )
     entries: list[dict] = []
-    for name, reachable, probed_at, resources, source, model, cpu, os_name in rows:
+    for entry in hosts.values():
+        name = entry["host"]
+        reachable = entry["reachable"]
+        probed_at = entry["probed_at"]
+        source = entry["source"]
         generation = host_gen(db, name)
-        platform = ((args.model, model), (args.cpu, cpu), (args.os, os_name))
+        platform = ((args.model, entry["model"]), (args.cpu, entry["cpu"]), (args.os, entry["os"]))
+        booked_status, booked_until, booked_by = _booked_summary(entry["resources"])
         if any(filter_value and filter_value.lower() not in (actual or "").lower() for filter_value, actual in platform):
             continue
-        if args.source and (source or "booked") != args.source:
+        if args.source and source != args.source:
             continue
         if args.reachable and not reachable:
+            continue
+        if args.available and booked_status != "free":
             continue
         if args.gen == "mixed" and "+" not in generation:
             continue
@@ -967,19 +1142,16 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
             continue
         if args.gen in ("CN5000", "CN6000") and args.gen not in generation:
             continue
-        entries.append(
+        entry.update(
             {
-                "host": name,
                 "generation": generation,
-                "reachable": bool(reachable) if probed_at else None,
-                "probed_at": probed_at,
-                "source": source or "booked",
-                "resources": [] if source == "discovered" else (resources.split(",") if resources else []),
-                "model": model,
-                "cpu": cpu,
-                "os": os_name,
+                "resources": [resource["name"] for resource in entry["resources"]],
+                "booked_status": booked_status,
+                "booked_until": booked_until,
+                "booked_by": booked_by,
             }
         )
+        entries.append(entry)
     summary = {
         "hosts": len(entries),
         "CN5000": sum(entry["generation"] == "CN5000" for entry in entries),
@@ -992,6 +1164,12 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
 
 def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Print filtered cache entries with a count users can verify at a glance."""
+    if not args.offline and _availability_is_stale(db):
+        try:
+            refresh_availability(db)
+        except UserError:
+            checked_at = db.execute("SELECT min(avail_checked_at) FROM resource").fetchone()[0]
+            print(f"Warning: Booked availability refresh failed; using cached values ({_age(checked_at)}).", file=sys.stderr)
     entries, summary = _list_entries(db, args)
     resource_count, synced_at = db.execute("SELECT count(*), max(synced_at) FROM resource").fetchone()
     hint = _cache_hint(resource_count, synced_at)
@@ -1013,9 +1191,9 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     wide = args.wide or args.model or args.cpu or args.os
     if wide:
-        print(f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'MODEL':<34} {'CPU':<44} {'OS':<34} RESOURCES")
+        print(f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'BOOKED':<42} {'MODEL':<34} {'CPU':<44} {'OS':<34} RESOURCES")
     else:
-        print(f"{'HOST':<26} {'GEN':<14} {'REACH':<9} RESOURCES")
+        print(f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'BOOKED':<12} RESOURCES")
     for entry in entries:
         reach = "unprobed" if entry["probed_at"] is None else ("yes" if entry["reachable"] else "no")
         generation = entry["generation"]
@@ -1025,13 +1203,16 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
         host_cell = f"{entry['host']:<26}"
         rendered_host = _paint(host_cell, "2") if entry["reachable"] is False else host_cell
         resources = "(not in Booked; discovered on fabric)" if entry["source"] == "discovered" else ", ".join(entry["resources"])
+        booked = _booked_cell(entry["booked_status"], entry["booked_until"], entry["booked_by"], wide)
+        booked_color = {"free": "32", "in use": "33", "unavailable": "31"}.get(entry["booked_status"])
+        rendered_booked = _paint(f"{booked:<42}" if wide else f"{booked:<12}", booked_color) if booked_color else (f"{booked:<42}" if wide else f"{booked:<12}")
         if wide:
             print(
-                f"{rendered_host} {rendered_gen} {reach:<9} {_short(entry['model'], 34):<34} "
+                f"{rendered_host} {rendered_gen} {reach:<9} {rendered_booked} {_short(entry['model'], 34):<34} "
                 f"{_short(entry['cpu'], 44):<44} {_short(entry['os'], 34):<34} {resources}"
             )
         else:
-            print(f"{rendered_host} {rendered_gen} {reach:<9} {resources}")
+            print(f"{rendered_host} {rendered_gen} {reach:<9} {rendered_booked} {resources}")
     print(
         f"{summary['hosts']} host{'s' if summary['hosts'] != 1 else ''} "
         f"({summary['CN5000']} CN5000, {summary['CN6000']} CN6000, "
@@ -1368,8 +1549,8 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers,
         "list",
         aliases=["ls"],
-        help_text="List cached hosts; use filters without contacting Booked or SSH.",
-        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --source discovered --json\n  cnhwinv ls --gen 5k -o csv > cn5000.csv\n  cnhwinv ls -o tsv | awk -F'\\t' '$3==\"yes\"{print $1}'",
+        help_text="List cached hosts; refreshes Booked availability older than five minutes unless --offline is used.",
+        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --available\n  cnhwinv list --offline --source discovered --json\n  cnhwinv ls --gen 5k -o csv > cn5000.csv\n  cnhwinv ls -o tsv | awk -F'\\t' '$3==\"yes\"{print $1}'",
     )
     listing.add_argument("--gen", type=_generation_argument, metavar="GEN", help="5k/6k/CN5000/CN6000, mixed, none, or unprobed")
     listing.add_argument("--reachable", action="store_true", help="only latest probes that were reachable")
@@ -1378,6 +1559,8 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--cpu", help="filter CPU model substring (case-insensitive)")
     listing.add_argument("--os", help="filter OS substring (case-insensitive)")
     listing.add_argument("--source", choices=["booked", "discovered"], help="filter Booked or fabric-discovered hosts")
+    listing.add_argument("--available", action="store_true", help="only hosts whose mapped Booked resources are all free")
+    listing.add_argument("--offline", action="store_true", help="do not refresh Booked availability; use cached values only")
     listing.add_argument("--json", action="store_true", help="shorthand for --format json")
     listing.add_argument("--format", "-o", choices=TABLE_FORMATS, default="table", help="output format: table (default), json, jsonl, csv, or tsv")
 
@@ -1414,6 +1597,10 @@ def open_db(path: Path) -> sqlite3.Connection:
             if column not in columns:
                 declaration = "TEXT DEFAULT 'booked'" if column == "source" else "TEXT"
                 db.execute(f"ALTER TABLE host ADD COLUMN {column} {declaration}")
+        resource_columns = {row[1] for row in db.execute("PRAGMA table_info(resource)")}
+        for column in ("avail_state", "avail_until", "avail_at", "reserved_by", "avail_checked_at"):
+            if column not in resource_columns:
+                db.execute(f"ALTER TABLE resource ADD COLUMN {column} TEXT")
         db.commit()
         return db
     except (OSError, sqlite3.Error) as error:

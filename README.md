@@ -2,10 +2,13 @@
 
 `cnhwinv` is a single-file, Python 3.11 standard-library CLI for
 maintaining a local inventory of Booked Scheduler lab hosts and cached,
-read-only SSH fabric facts. Reporting commands (`list`, `show`, `links`, and
-`status`) only read SQLite; `update`, `probe`, `discover`, and `sync-booked`
-are the commands that contact Booked or lab hosts. The remote scripts are
-read-only and are regression-tested against state-changing commands.
+read-only SSH fabric facts. `list` refreshes the cached Booked availability
+when its value is older than five minutes (unless `--offline` is passed); if a
+refresh fails it warns and uses the cached value with its age. The
+other reporting commands (`show`, `links`, and `status`) only read SQLite.
+`update`, `probe`, `discover`, and `sync-booked` are the commands that contact
+Booked or lab hosts. The remote scripts are read-only and are regression-tested
+against state-changing commands.
 
 ## Setup
 
@@ -32,6 +35,8 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 # Inspect the cache. `ls` and `list` are interchangeable.
 ./cnhwinv ls --gen 6k --reachable -w
 ./cnhwinv list --source discovered --json
+./cnhwinv list --available                  # every mapped Booked resource is free
+./cnhwinv list --offline                    # use cached Booked availability only
 ./cnhwinv ls --gen 5k -o csv > cn5000.csv   # also: -o tsv | jsonl | json
 
 # Host names are case-insensitive and support a unique partial match.
