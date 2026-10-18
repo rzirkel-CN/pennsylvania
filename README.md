@@ -5,7 +5,8 @@ maintaining a local inventory of Booked Scheduler lab hosts and cached,
 read-only SSH fabric facts. `list` refreshes the cached Booked availability
 when its value is older than five minutes (unless `--offline` is passed); if a
 refresh fails it warns and uses the cached value with its age. The
-other reporting commands (`show`, `links`, and `status`) only read SQLite.
+`show` follows the same five-minute availability refresh policy and supports
+`--offline`; `links` and `status` only read SQLite.
 `update`, `probe`, `discover`, and `sync-booked` are the commands that contact
 Booked or lab hosts. The remote scripts are read-only and are regression-tested
 against state-changing commands.
@@ -36,20 +37,24 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 ./cnhwinv ls --gen 6k --reachable -w
 ./cnhwinv list --source discovered --json
 ./cnhwinv list --available                  # every mapped Booked resource is free
+./cnhwinv list --link down --gen 5k          # cached Cornelis HSN links with no ports up
 ./cnhwinv list --offline                    # use cached Booked availability only
 ./cnhwinv ls --gen 5k -o csv > cn5000.csv   # also: -o tsv | jsonl | json
 
 # Host names are case-insensitive and support a unique partial match.
-# A Booked resource name lists all its assigned hosts.
-./cnhwinv show cn123
+# `show` prints all cached host/resource, adapter, port, LLDP, and Booked facts.
+./cnhwinv show cn123 --offline
 ./cnhwinv show 'Rack A' --json
+./cnhwinv show 'Rack A' --offline
 
 # Cached fabric/Ethernet peer evidence and common-switch membership.
 ./cnhwinv links --gen CN6000
 ```
 
 Generation accepts `5k`, `6k`, `5000`, `6000`, `CN5000`, and `CN6000`
-case-insensitively. Human-facing output uses color only on a terminal; set
+case-insensitively. The `LINK` column summarizes cached Cornelis OPA and
+Ethernet-mode port states as `up`, `down`, `N/M up`, or `-`; use
+`--link up|down|partial` to filter it. Human-facing output uses color only on a terminal; set
 `NO_COLOR=1` or pass `--no-color` to disable it. Use `--json` with `status`,
 `list`, `show`, or `links` for scripts; `list` and `links` also accept
 `--format/-o` `csv`, `tsv`, `jsonl` (one record per line), or `json`. Use `--debug` only when you need a

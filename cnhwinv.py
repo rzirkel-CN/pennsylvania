@@ -1068,8 +1068,34 @@ def _booked_cell(status: str, until: str | None, owner: str | None, wide: bool) 
     if status != "in use" or not wide:
         return status
     time = _booked_datetime(until)
-    suffix = f" until {time.strftime('%H:%M')}" if time else ""
+    suffix = ""
+    if time:
+        suffix = f" until {time.strftime('%H:%M')}" if time.date() == datetime.now(time.tzinfo).date() else f" until {time.strftime('%Y-%m-%d %H:%M')}"
     return f"in use{suffix}" + (f" by {owner}" if owner else "")
+
+
+def _hsn_link(db: sqlite3.Connection, host: str, probed_at: str | None, reachable: bool | None) -> tuple[str, int, int]:
+    """Summarize cached Cornelis OPA and Ethernet-mode port link states for one host."""
+    if not probed_at or not reachable:
+        return "-", 0, 0
+    ports = list(db.execute("SELECT kind, state FROM port WHERE host=? AND state IS NOT NULL", (host,)))
+    if not ports:
+        return "-", 0, 0
+    up = sum(state.lower() == "active" if kind == "opa" else state.lower() == "up" for kind, state in ports)
+    total = len(ports)
+    if up == total:
+        return "up", up, total
+    if not up:
+        return "down", up, total
+    return f"{up}/{total} up", up, total
+
+
+def _normalise_link(value: str) -> str:
+    """Accept case-insensitive user link filters while retaining canonical choices."""
+    normalized = value.lower()
+    if normalized not in {"up", "down", "partial"}:
+        raise argparse.ArgumentTypeError("link must be up, down, or partial")
+    return normalized
 
 
 def _normalise_generation(value: str, allow_controls: bool = True) -> str:
@@ -1126,6 +1152,7 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
         generation = host_gen(db, name)
         platform = ((args.model, entry["model"]), (args.cpu, entry["cpu"]), (args.os, entry["os"]))
         booked_status, booked_until, booked_by = _booked_summary(entry["resources"])
+        hsn_link, hsn_ports_up, hsn_ports_total = _hsn_link(db, name, probed_at, reachable)
         if any(filter_value and filter_value.lower() not in (actual or "").lower() for filter_value, actual in platform):
             continue
         if args.source and source != args.source:
@@ -1133,6 +1160,10 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
         if args.reachable and not reachable:
             continue
         if args.available and booked_status != "free":
+            continue
+        if args.link and (args.link == "partial") != (hsn_ports_total > 0 and 0 < hsn_ports_up < hsn_ports_total):
+            continue
+        if args.link in ("up", "down") and hsn_link != args.link:
             continue
         if args.gen == "mixed" and "+" not in generation:
             continue
@@ -1146,6 +1177,9 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
             {
                 "generation": generation,
                 "resources": [resource["name"] for resource in entry["resources"]],
+                "hsn_link": hsn_link,
+                "hsn_ports_up": hsn_ports_up,
+                "hsn_ports_total": hsn_ports_total,
                 "booked_status": booked_status,
                 "booked_until": booked_until,
                 "booked_by": booked_by,
@@ -1191,9 +1225,9 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     wide = args.wide or args.model or args.cpu or args.os
     if wide:
-        print(f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'BOOKED':<42} {'MODEL':<34} {'CPU':<44} {'OS':<34} RESOURCES")
+        print(f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'LINK':<10} {'BOOKED':<42} {'MODEL':<34} {'CPU':<44} {'OS':<34} RESOURCES")
     else:
-        print(f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'BOOKED':<12} RESOURCES")
+        print(f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'LINK':<10} {'BOOKED':<12} RESOURCES")
     for entry in entries:
         reach = "unprobed" if entry["probed_at"] is None else ("yes" if entry["reachable"] else "no")
         generation = entry["generation"]
@@ -1203,16 +1237,19 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
         host_cell = f"{entry['host']:<26}"
         rendered_host = _paint(host_cell, "2") if entry["reachable"] is False else host_cell
         resources = "(not in Booked; discovered on fabric)" if entry["source"] == "discovered" else ", ".join(entry["resources"])
+        link = entry["hsn_link"]
+        link_color = "32" if link == "up" else "31" if link == "down" else "33" if link.endswith(" up") else None
+        rendered_link = _paint(f"{link:<10}", link_color) if link_color else f"{link:<10}"
         booked = _booked_cell(entry["booked_status"], entry["booked_until"], entry["booked_by"], wide)
         booked_color = {"free": "32", "in use": "33", "unavailable": "31"}.get(entry["booked_status"])
         rendered_booked = _paint(f"{booked:<42}" if wide else f"{booked:<12}", booked_color) if booked_color else (f"{booked:<42}" if wide else f"{booked:<12}")
         if wide:
             print(
-                f"{rendered_host} {rendered_gen} {reach:<9} {rendered_booked} {_short(entry['model'], 34):<34} "
+                f"{rendered_host} {rendered_gen} {reach:<9} {rendered_link} {rendered_booked} {_short(entry['model'], 34):<34} "
                 f"{_short(entry['cpu'], 44):<44} {_short(entry['os'], 34):<34} {resources}"
             )
         else:
-            print(f"{rendered_host} {rendered_gen} {reach:<9} {rendered_booked} {resources}")
+            print(f"{rendered_host} {rendered_gen} {reach:<9} {rendered_link} {rendered_booked} {resources}")
     print(
         f"{summary['hosts']} host{'s' if summary['hosts'] != 1 else ''} "
         f"({summary['CN5000']} CN5000, {summary['CN6000']} CN6000, "
@@ -1305,8 +1342,88 @@ def _fabric_groups(db: sqlite3.Connection) -> list[dict]:
     return groups
 
 
+def _resource_detail(db: sqlite3.Connection, resource_id: int) -> dict:
+    """Gather every cached Booked resource fact plus mapped-host summaries."""
+    row = db.execute(
+        "SELECT id, name, schedule_id, status_id, description, notes, hosts_raw, attrs_json, synced_at, "
+        "avail_state, avail_until, avail_at, reserved_by, avail_checked_at FROM resource WHERE id=?",
+        (resource_id,),
+    ).fetchone()
+    if not row:
+        raise UserError(f"Booked resource {resource_id}: not in database")
+    attributes = json.loads(row[7]) if row[7] else {}
+    mapped_hosts = [
+        {
+            "host": host,
+            "generation": host_gen(db, host),
+            "reachable": bool(reachable) if probed_at else None,
+            "probed_at": probed_at,
+        }
+        for host, reachable, probed_at in db.execute(
+            "SELECT h.name, h.reachable, h.probed_at FROM resource_host rh JOIN host h ON h.name=rh.host "
+            "WHERE rh.resource_id=? ORDER BY h.name",
+            (resource_id,),
+        )
+    ]
+    return {
+        "resource_id": row[0],
+        "name": row[1],
+        "schedule_id": row[2],
+        "status_id": row[3],
+        "status": {"0": "Hidden", "1": "Available", "2": "Unavailable"}.get(str(row[3]), f"Unknown ({row[3]})"),
+        "description": mask(row[4]) or None,
+        "notes": mask(row[5]) or None,
+        "raw_hosts": mask(row[6]) or None,
+        "attributes": {label: mask(value) for label, value in attributes.items() if value},
+        "synced_at": row[8],
+        "synced_age": _age(row[8]),
+        "avail_state": row[9],
+        "avail_until": row[10],
+        "avail_at": row[11],
+        "reserved_by": row[12],
+        "avail_checked_at": row[13],
+        "avail_checked_age": _age(row[13]),
+        "mapped_hosts": mapped_hosts,
+    }
+
+
+def _port_detail(db: sqlite3.Connection, host: str) -> list[dict]:
+    """Gather all stored port columns with resolved fabric neighbor names."""
+    owners = _guid_owner(db)
+    switch_names = dict(db.execute("SELECT guid, name FROM fabric_node WHERE type='SW'"))
+    ports: list[dict] = []
+    for row in db.execute(
+        "SELECT ifname, port, pci_addr, kind, node_guid, port_guid, state, phys_state, lid, neighbor_type, "
+        "neighbor_guid, neighbor_port, mac, netdev, lldp_json FROM port WHERE host=? ORDER BY kind, ifname, port",
+        (host,),
+    ):
+        lldp = json.loads(row[14]) if row[14] else None
+        neighbor_name = owners.get((row[10] or "").lower()) or switch_names.get(row[10])
+        ports.append(
+            {
+                "ifname": row[0],
+                "port": row[1],
+                "pci_addr": row[2],
+                "kind": row[3],
+                "node_guid": row[4],
+                "port_guid": row[5],
+                "state": row[6],
+                "phys_state": row[7],
+                "lid": row[8],
+                "neighbor_type": row[9],
+                "neighbor_guid": row[10],
+                "neighbor_port": row[11],
+                "neighbor_name": neighbor_name,
+                "mac": row[12],
+                "netdev": row[13],
+                "lldp": lldp,
+            }
+        )
+    return ports
+
+
 def _host_detail(db: sqlite3.Connection, host: str) -> dict:
-    """Gather all local cache facts for a resolved host name."""
+    """Gather every cached host fact, including complete mapped-resource details."""
     row = db.execute(
         "SELECT name, probed_at, reachable, error, fqdn, source, model, cpu, sockets, cores, os, kernel FROM host WHERE name=?",
         (host,),
@@ -1314,11 +1431,8 @@ def _host_detail(db: sqlite3.Connection, host: str) -> dict:
     if not row:
         raise UserError(f"{host}: not in database")
     resources = [
-        {"id": resource_id, "name": name}
-        for resource_id, name in db.execute(
-            "SELECT r.id, r.name FROM resource r JOIN resource_host rh ON rh.resource_id=r.id WHERE rh.host=? ORDER BY r.name",
-            (host,),
-        )
+        _resource_detail(db, resource_id)
+        for (resource_id,) in db.execute("SELECT resource_id FROM resource_host WHERE host=? ORDER BY resource_id", (host,))
     ]
     adapters = [
         {"pci_addr": pci, "device_id": device, "generation": generation, "pci_class": pci_class, "description": description}
@@ -1328,6 +1442,7 @@ def _host_detail(db: sqlite3.Connection, host: str) -> dict:
     ]
     return {
         "host": row[0],
+        "generation": host_gen(db, row[0]),
         "probed_at": row[1],
         "reachable": bool(row[2]) if row[1] else None,
         "error": row[3],
@@ -1341,45 +1456,106 @@ def _host_detail(db: sqlite3.Connection, host: str) -> dict:
         "kernel": row[11],
         "resources": resources,
         "adapters": adapters,
-        "links": _link_records(db, "p.host=?", (host,)),
+        "ports": _port_detail(db, host),
     }
 
 
+def _print_multiline(label: str, value: str | None, indent: str = "  ") -> None:
+    """Print a non-empty multiline cached field with continuation indentation."""
+    if not value:
+        return
+    lines = value.splitlines() or [value]
+    print(f"{indent}{label}: {lines[0]}")
+    for line in lines[1:]:
+        print(f"{indent}  {line}")
+
+
+def _full_booked_time(value: str | None) -> str | None:
+    """Render a Booked timestamp as a full local date and time for detail output."""
+    time = _booked_datetime(value)
+    return time.strftime("%Y-%m-%d %H:%M %z") if time else value
+
+
+def _print_resource_detail(detail: dict, indent: str = "") -> None:
+    """Render every non-empty cached Booked resource field safely for terminals."""
+    print(f"{indent}Booked resource {detail['resource_id']}: {detail['name']}")
+    if detail["schedule_id"] is not None:
+        print(f"{indent}  Schedule: {detail['schedule_id']}")
+    print(f"{indent}  Status: {detail['status']}")
+    if detail["avail_state"]:
+        print(f"{indent}  Availability: {detail['avail_state']}")
+    if detail["reserved_by"]:
+        print(f"{indent}  Reserved by: {detail['reserved_by']}")
+    if detail["avail_until"]:
+        print(f"{indent}  Available until: {_full_booked_time(detail['avail_until'])}")
+    if detail["avail_at"]:
+        print(f"{indent}  Free again at: {_full_booked_time(detail['avail_at'])}")
+    if detail["avail_checked_at"]:
+        print(f"{indent}  Availability checked: {detail['avail_checked_at']} UTC ({detail['avail_checked_age']})")
+    if detail["synced_at"]:
+        print(f"{indent}  Synced: {detail['synced_at']} UTC ({detail['synced_age']})")
+    _print_multiline("Description", detail["description"], indent + "  ")
+    _print_multiline("Notes", detail["notes"], indent + "  ")
+    if detail["attributes"]:
+        print(f"{indent}  Attributes:")
+        for label, value in detail["attributes"].items():
+            _print_multiline(label, value, indent + "    ")
+    _print_multiline("Raw hosts", detail["raw_hosts"], indent + "  ")
+    if detail["mapped_hosts"]:
+        print(f"{indent}  Mapped hosts:")
+        for host in detail["mapped_hosts"]:
+            reach = "unprobed" if host["reachable"] is None else ("yes" if host["reachable"] else "no")
+            print(f"{indent}    {host['host']}  gen={host['generation']}  reachable={reach}")
+
+
 def _print_host_detail(detail: dict) -> None:
-    """Render one host's cached facts for an interactive terminal."""
-    print(
-        f"Host: {detail['host']}  fqdn={detail['fqdn'] or '-'}  reachable="
-        f"{'unprobed' if detail['reachable'] is None else detail['reachable']}  probed={detail['probed_at'] or '-'}  {detail['error'] or ''}"
-    )
-    if detail["reachable"]:
-        print(f"  Model:  {detail['model'] or '?'}")
-        socket_detail = f"  ({detail['sockets']} socket(s), {detail['cores']} logical CPUs)" if detail["sockets"] else ""
-        print(f"  CPU:    {detail['cpu'] or '?'}{socket_detail}")
-        print(f"  OS:     {detail['os'] or '?'}  (kernel {detail['kernel'] or '?'})")
+    """Render every non-empty cached host, adapter, port, and resource fact."""
+    print(f"Host: {detail['host']}")
+    for label, key in (("Generation", "generation"), ("Source", "source"), ("FQDN", "fqdn"), ("Probed", "probed_at"), ("Model", "model"), ("CPU", "cpu"), ("Sockets", "sockets"), ("Cores", "cores"), ("OS", "os"), ("Kernel", "kernel"), ("Error", "error")):
+        if detail[key] is not None:
+            print(f"  {label}: {detail[key]}")
+    if detail["reachable"] is not None:
+        print(f"  Reachable: {'yes' if detail['reachable'] else 'no'}")
+    if detail["adapters"]:
+        print("  Adapters:")
+        for adapter in detail["adapters"]:
+            fields = [adapter["pci_addr"], adapter["generation"], f"[434e:{adapter['device_id']}]", adapter["pci_class"], adapter["description"]]
+            print("    " + "  ".join(str(field) for field in fields if field))
+    if detail["ports"]:
+        print("  Ports:")
+        for port in detail["ports"]:
+            print(f"    {port['kind']} {port['ifname']}/{port['port']}")
+            for label, key in (("PCI", "pci_addr"), ("State", "state"), ("Physical state", "phys_state"), ("LID", "lid"), ("Node GUID", "node_guid"), ("Port GUID", "port_guid"), ("MAC", "mac"), ("Netdev", "netdev")):
+                if port[key] is not None:
+                    print(f"      {label}: {port[key]}")
+            if port["neighbor_type"] or port["neighbor_guid"] or port["neighbor_port"] is not None:
+                neighbor = " ".join(str(value) for value in (port["neighbor_type"], port["neighbor_name"] or port["neighbor_guid"], f"port {port['neighbor_port']}" if port["neighbor_port"] is not None else None) if value)
+                print(f"      Neighbor: {neighbor}")
+            if port["lldp"]:
+                print(f"      LLDP: {json.dumps(port['lldp'], sort_keys=True)}")
     for resource in detail["resources"]:
-        print(f"  Booked resource {resource['id']}: {resource['name']}")
-    for adapter in detail["adapters"]:
-        print(
-            f"  {adapter['pci_addr']}  {adapter['generation']}  [434e:{adapter['device_id']}]  "
-            f"{adapter['pci_class']}  {adapter['description']}"
-        )
-    for link in detail["links"]:
-        print(f"  {link['local']:<34} {link['generation'] or '?':<7} {link['state'] or '?':<7} -> {link['peer']}")
+        _print_resource_detail(resource, "  ")
 
 
-def _resource_detail(db: sqlite3.Connection, resource_id: int) -> dict:
-    """Gather the hosts assigned to a Booked resource without reaching Booked."""
-    resource = db.execute("SELECT id, name FROM resource WHERE id=?", (resource_id,)).fetchone()
-    hosts = [host for (host,) in db.execute("SELECT host FROM resource_host WHERE resource_id=? ORDER BY host", (resource_id,))]
-    return {"resource_id": resource[0], "name": resource[1], "hosts": hosts}
+def _refresh_show_availability(db: sqlite3.Connection, offline: bool) -> None:
+    """Refresh stale Booked availability for show unless the caller requires cached-only data."""
+    if offline or not _availability_is_stale(db):
+        return
+    try:
+        refresh_availability(db)
+    except UserError:
+        checked_at = db.execute("SELECT min(avail_checked_at) FROM resource").fetchone()[0]
+        print(f"Warning: Booked availability refresh failed; using cached values ({_age(checked_at)}).", file=sys.stderr)
 
 
 def cmd_show(db: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Resolve host/resource names flexibly and show cache facts or helpful candidates."""
+    """Resolve host/resource names and show complete cache facts."""
+    _refresh_show_availability(db, args.offline)
     query = args.host.strip().lower()
     hosts = [host for (host,) in db.execute("SELECT name FROM host ORDER BY name")]
     resources = [(resource_id, name) for resource_id, name in db.execute("SELECT id, name FROM resource ORDER BY name")]
     exact_hosts = [host for host in hosts if host.lower() == query]
+    short_hosts = [host for host in hosts if host.lower().split(".", 1)[0] == query]
     exact_resources = [resource for resource in resources if resource[1].lower() == query]
     host_matches = [host for host in hosts if query in host.lower()]
     resource_matches = [resource for resource in resources if query in resource[1].lower()]
@@ -1391,15 +1567,19 @@ def cmd_show(db: sqlite3.Connection, args: argparse.Namespace) -> int:
         else:
             _print_host_detail(detail)
         return 0
+    if len(short_hosts) == 1:
+        detail = _host_detail(db, short_hosts[0])
+        if args.json:
+            _json(detail)
+        else:
+            _print_host_detail(detail)
+        return 0
     if exact_resources:
         detail = _resource_detail(db, exact_resources[0][0])
         if args.json:
             _json(detail)
         else:
-            print(f"Booked resource {detail['resource_id']}: {detail['name']}")
-            print(f"Hosts ({len(detail['hosts'])}):")
-            for host in detail["hosts"]:
-                print(f"  {host}")
+            _print_resource_detail(detail)
         return 0
     if len(host_matches) > 1:
         raise UserError(f"{args.host!r} matches multiple hosts: {', '.join(host_matches)}")
@@ -1420,10 +1600,7 @@ def cmd_show(db: sqlite3.Connection, args: argparse.Namespace) -> int:
         if args.json:
             _json(detail)
         else:
-            print(f"Booked resource {detail['resource_id']}: {detail['name']}")
-            print(f"Hosts ({len(detail['hosts'])}):")
-            for host in detail["hosts"]:
-                print(f"  {host}")
+            _print_resource_detail(detail)
         return 0
 
     names = hosts + [name for _, name in resources]
@@ -1550,7 +1727,7 @@ def build_parser() -> argparse.ArgumentParser:
         "list",
         aliases=["ls"],
         help_text="List cached hosts; refreshes Booked availability older than five minutes unless --offline is used.",
-        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --available\n  cnhwinv list --offline --source discovered --json\n  cnhwinv ls --gen 5k -o csv > cn5000.csv\n  cnhwinv ls -o tsv | awk -F'\\t' '$3==\"yes\"{print $1}'",
+        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --available\n  cnhwinv list --link down --gen 5k\n  cnhwinv list --offline --source discovered --json\n  cnhwinv ls --gen 5k -o csv > cn5000.csv\n  cnhwinv ls -o tsv | awk -F'\\t' '$3==\"yes\"{print $1}'",
     )
     listing.add_argument("--gen", type=_generation_argument, metavar="GEN", help="5k/6k/CN5000/CN6000, mixed, none, or unprobed")
     listing.add_argument("--reachable", action="store_true", help="only latest probes that were reachable")
@@ -1560,6 +1737,7 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--os", help="filter OS substring (case-insensitive)")
     listing.add_argument("--source", choices=["booked", "discovered"], help="filter Booked or fabric-discovered hosts")
     listing.add_argument("--available", action="store_true", help="only hosts whose mapped Booked resources are all free")
+    listing.add_argument("--link", type=_normalise_link, metavar="STATE", help="filter HSN link: up, down, or partial")
     listing.add_argument("--offline", action="store_true", help="do not refresh Booked availability; use cached values only")
     listing.add_argument("--json", action="store_true", help="shorthand for --format json")
     listing.add_argument("--format", "-o", choices=TABLE_FORMATS, default="table", help="output format: table (default), json, jsonl, csv, or tsv")
@@ -1567,10 +1745,11 @@ def build_parser() -> argparse.ArgumentParser:
     show = _subparser(
         subparsers,
         "show",
-        help_text="Show one host or one Booked resource from the cache.",
-        examples="cnhwinv show cn123\n  cnhwinv show 'Rack A' --json",
+        help_text="Show complete cached facts; refreshes Booked availability older than five minutes unless --offline is used.",
+        examples="cnhwinv show cn123 --offline\n  cnhwinv show 'Rack A' --json\n  cnhwinv show 'Rack A' --offline",
     )
     show.add_argument("host", metavar="HOST_OR_RESOURCE", help="case-insensitive full or unique partial name")
+    show.add_argument("--offline", action="store_true", help="do not refresh Booked availability; use cached values only")
     show.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
     links = _subparser(

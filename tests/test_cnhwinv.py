@@ -219,6 +219,72 @@ opasmaquery: failed to open port: Device or resource busy
         self.assertNotIn("offline01", text)
         self.assertIn("1 host (0 CN5000, 1 CN6000", text)
 
+    def test_list_hsn_link_summary_filter_and_structured_fields(self) -> None:
+        self.add_host("up01")
+        self.add_host("partial01")
+        self.add_host("down01")
+        self.add_host("noport01")
+        self.db.execute("INSERT INTO host(name, source) VALUES ('unprobed01', 'booked')")
+        self.db.executemany(
+            "INSERT INTO port(host, ifname, port, kind, state) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("up01", "hfi1_0", 1, "opa", "ACTIVE"),
+                ("up01", "ens1", 0, "eth", "up"),
+                ("partial01", "hfi1_0", 1, "opa", "ACTIVE"),
+                ("partial01", "hfi1_0", 2, "opa", "DOWN"),
+                ("down01", "hfi1_0", 1, "opa", "DOWN"),
+            ],
+        )
+        self.db.commit()
+
+        code, text, _ = self.run_cli("list", "--offline")
+
+        self.assertEqual(code, 0)
+        self.assertIn("LINK", text)
+        self.assertIn("up01", text)
+        self.assertIn("1/2 up", text)
+        self.assertIn("down01", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "--link", "PARTIAL")
+
+        self.assertEqual(code, 0)
+        self.assertIn("partial01", text)
+        self.assertNotIn("up01", text)
+        self.assertNotIn("down01", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "-o", "csv")
+
+        self.assertEqual(code, 0)
+        rows = {row["host"]: row for row in __import__("csv").DictReader(io.StringIO(text))}
+        self.assertEqual((rows["up01"]["hsn_link"], rows["up01"]["hsn_ports_up"], rows["up01"]["hsn_ports_total"]), ("up", "2", "2"))
+        self.assertEqual((rows["partial01"]["hsn_link"], rows["partial01"]["hsn_ports_up"], rows["partial01"]["hsn_ports_total"]), ("1/2 up", "1", "2"))
+        self.assertEqual((rows["down01"]["hsn_link"], rows["down01"]["hsn_ports_up"], rows["down01"]["hsn_ports_total"]), ("down", "0", "1"))
+        self.assertEqual((rows["noport01"]["hsn_link"], rows["unprobed01"]["hsn_link"]), ("-", "-"))
+
+    def test_list_hsn_link_tty_colors(self) -> None:
+        self.add_host("up01")
+        self.add_host("partial01")
+        self.add_host("down01")
+        self.db.executemany(
+            "INSERT INTO port(host, ifname, port, kind, state) VALUES (?, ?, ?, 'opa', ?)",
+            [
+                ("up01", "hfi1_0", 1, "ACTIVE"),
+                ("partial01", "hfi1_0", 1, "ACTIVE"),
+                ("partial01", "hfi1_0", 2, "DOWN"),
+                ("down01", "hfi1_0", 1, "DOWN"),
+            ],
+        )
+        self.db.commit()
+        tty = TtyBuffer()
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "stdout", tty):
+            code = bi.main(["--db", str(self.db_path), "list", "--offline"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("\x1b[32mup", tty.getvalue())
+        self.assertIn("\x1b[33m1/2 up", tty.getvalue())
+        self.assertIn("\x1b[31mdown", tty.getvalue())
+
     def test_sync_booked_populates_cached_availability(self) -> None:
         resources = [
             {
@@ -266,9 +332,9 @@ opasmaquery: failed to open port: Device or resource busy
         self.assertIn("free01", text)
         self.assertIn("free", text)
         self.assertIn("busy01", text)
-        self.assertIn("in use until 15:30 by Ada Lovelace", text)
+        self.assertIn("in use until 2026-10-17 15:30 by Ada Lovelace", text)
         self.assertIn("mixed01", text)
-        self.assertIn("in use until 15:30 by Ada Lovelace", text)
+        self.assertIn("in use until 2026-10-17 15:30 by Ada Lovelace", text)
         self.assertIn("discovered01", text)
         self.assertIn("-", text)
 
@@ -421,11 +487,111 @@ opasmaquery: failed to open port: Device or resource busy
         self.assertIn("MODEL", text)
         self.assertIn("discovered01", text)
 
+    def test_show_resource_displays_full_cached_booked_details(self) -> None:
+        self.add_host("detail01")
+        self.add_resource(7, "Detail rack", ["detail01"], avail_state="reserved", avail_at="2026-11-16T13:59:00-0600", reserved_by="Ada Lovelace")
+        self.db.execute(
+            "UPDATE resource SET schedule_id=9, status_id=1, description=?, notes=?, hosts_raw=?, attrs_json=?, "
+            "synced_at=datetime('now', '-1 hour'), avail_checked_at=datetime('now', '-2 minutes') WHERE id=7",
+            (
+                "Rack description\nSecond line",
+                "Password: hunter2\nKeep cool",
+                "detail01\ndetail02",
+                json.dumps({"Console": "ttyS0", "Secret": "Password: hunter2"}),
+            ),
+        )
+        self.db.commit()
+
+        code, text, _ = self.run_cli("show", "detail rack", "--offline")
+
+        self.assertEqual(code, 0)
+        self.assertIn("Booked resource 7: Detail rack", text)
+        self.assertIn("Schedule: 9", text)
+        self.assertIn("Status: Available", text)
+        self.assertIn("Availability: reserved", text)
+        self.assertIn("Reserved by: Ada Lovelace", text)
+        self.assertIn("Free again at: 2026-11-16 13:59", text)
+        self.assertIn("Description:", text)
+        self.assertIn("Rack description", text)
+        self.assertIn("Notes:", text)
+        self.assertIn("<redacted>", text)
+        self.assertNotIn("hunter2", text)
+        self.assertIn("Attributes:", text)
+        self.assertIn("Console: ttyS0", text)
+        self.assertIn("Raw hosts:", text)
+        self.assertIn("detail01", text)
+        self.assertIn("Mapped hosts:", text)
+
+    def test_show_host_includes_resource_attributes_and_complete_ports(self) -> None:
+        self.add_host("detail01")
+        self.add_adapter("detail01", "0000:01:00.0", "CN5000")
+        self.add_resource(7, "Detail rack", ["detail01"])
+        self.db.execute("UPDATE resource SET attrs_json=? WHERE id=7", (json.dumps({"Console": "ttyS0"}),))
+        self.db.execute(
+            "INSERT INTO port(host, ifname, port, pci_addr, kind, node_guid, port_guid, state, phys_state, lid, "
+            "neighbor_type, neighbor_guid, neighbor_port, mac, netdev, lldp_json) "
+            "VALUES ('detail01', 'hfi1_0', 1, '0000:01:00.0', 'opa', '0xaaa', '0xaab', 'ACTIVE', 'LinkUp', '17', "
+            "'Switch', '0xswitch', 5, NULL, NULL, NULL)"
+        )
+        self.db.execute("INSERT INTO fabric_node(guid, type, name) VALUES ('0xswitch', 'SW', 'core-switch')")
+        self.db.execute(
+            "INSERT INTO port(host, ifname, port, pci_addr, kind, state, mac, netdev, lldp_json) "
+            "VALUES ('detail01', 'ens1', 0, '0000:02:00.0', 'eth', 'up', '02:00:00:00:00:01', 'ens1', ?) ",
+            (json.dumps({"chassis": "switch-a", "port": "Ethernet1/1"}),),
+        )
+        self.db.commit()
+
+        code, text, _ = self.run_cli("show", "detail01", "--offline")
+
+        self.assertEqual(code, 0)
+        self.assertIn("Source: booked", text)
+        self.assertIn("Adapters:", text)
+        self.assertIn("0000:01:00.0", text)
+        self.assertIn("Ports:", text)
+        self.assertIn("Physical state: LinkUp", text)
+        self.assertIn("Neighbor: Switch core-switch", text)
+        self.assertIn("LLDP:", text)
+        self.assertIn("Console: ttyS0", text)
+
+    def test_show_json_contains_resource_attributes_and_show_offline_skips_refresh(self) -> None:
+        self.add_host("json-detail01")
+        self.add_resource(7, "JSON detail", ["json-detail01"])
+        self.db.execute("UPDATE resource SET attrs_json=?, avail_checked_at=datetime('now', '-10 minutes') WHERE id=7", (json.dumps({"Console": "ttyS0"}),))
+        self.db.commit()
+
+        with mock.patch.object(bi, "refresh_availability") as refresh:
+            code, text, _ = self.run_cli("show", "JSON detail", "--offline", "--json")
+
+        self.assertEqual(code, 0)
+        refresh.assert_not_called()
+        detail = json.loads(text)
+        self.assertEqual(detail["attributes"], {"Console": "ttyS0"})
+        self.assertEqual(detail["mapped_hosts"][0]["host"], "json-detail01")
+
+    def test_wide_list_in_use_includes_date_when_not_today(self) -> None:
+        self.add_host("dated01")
+        self.add_resource(1, "Dated rack", ["dated01"], avail_state="reserved", avail_at="2026-11-16T13:59:00-0600", reserved_by="Ada")
+
+        code, text, _ = self.run_cli("list", "--offline", "--wide")
+
+        self.assertEqual(code, 0)
+        self.assertIn("in use until 2026-11-16 13:59 by Ada", text)
+
     def test_show_resolves_unique_case_insensitive_substring(self) -> None:
         self.add_host("cn-alpha01")
         code, text, _ = self.run_cli("show", "ALPHA")
         self.assertEqual(code, 0)
         self.assertIn("Host: cn-alpha01", text)
+
+    def test_show_prefers_an_exact_short_hostname_over_substring_matches(self) -> None:
+        self.add_host("arm-01.cornelisnetworks.com")
+        self.add_host("sw-arm-01")
+
+        code, text, _ = self.run_cli("show", "arm-01", "--offline")
+
+        self.assertEqual(code, 0)
+        self.assertIn("Host: arm-01.cornelisnetworks.com", text)
+        self.assertNotIn("Host: sw-arm-01", text)
 
     def test_show_reports_ambiguous_host_matches(self) -> None:
         self.add_host("lab-alpha01")
@@ -575,9 +741,9 @@ opasmaquery: failed to open port: Device or resource busy
             ["refresh", "--jobs", "2"],
             ["discover", "--jobs", "2", "--timeout", "5"],
             ["status"],
-            ["list", "--gen", "5000", "--reachable", "--wide", "--model", "SR655", "--cpu", "EPYC", "--os", "Rocky", "--source", "booked", "--available", "--offline"],
+            ["list", "--gen", "5000", "--reachable", "--wide", "--model", "SR655", "--cpu", "EPYC", "--os", "Rocky", "--source", "booked", "--available", "--link", "up", "--offline"],
             ["ls", "--gen", "CN6000"],
-            ["show", "host01"],
+            ["show", "host01", "--offline"],
             ["links", "--gen", "6000"],
         ]
         for args in cases:
