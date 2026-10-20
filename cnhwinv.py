@@ -19,6 +19,7 @@ import difflib
 import json
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -226,49 +227,81 @@ def _fallback_availability(db: sqlite3.Connection, payload: dict, now: datetime)
         )
 
 
-def refresh_availability(db: sqlite3.Connection) -> None:
-    """Refresh all Booked resource availability with one or two read-only GET requests."""
+def fetch_booked(include_resources: bool) -> dict:
+    """Fetch Booked data over one session, issuing the independent GETs concurrently.
+
+    The resource list, availability, and current reservations do not depend on
+    each other, so they are requested in parallel instead of one after another
+    (and across two logins, as before). Reservations are always requested because
+    a parallel GET costs no extra wall time; they only supply optional owner names
+    unless the availability endpoint is missing. This function never touches
+    SQLite, so callers may run it on a worker thread.
+    """
     now = datetime.now(timezone.utc)
     query = urllib.parse.quote(now.isoformat())
-    with _booked_session() as headers:
-        payload = _call("/Resources/Availability", headers=headers)
-        if "resources" not in payload:
-            reservations = _call(f"/Reservations/?startDateTime={query}&endDateTime={query}", headers=headers)
-            _fallback_availability(db, reservations, now)
-        else:
-            entries = _availability_entries(payload)
-            reserved = {
-                str(entry.get("resource", {}).get("resourceId"))
-                for entry in entries
-                if entry.get("resource", {}).get("resourceId") is not None
-                and _availability_state(entry.get("resource", {}).get("statusId"), bool(entry.get("available"))) == "reserved"
-            }
-            owners: dict[str, str | None] = {}
-            if reserved:
-                reservations = _call(f"/Reservations/?startDateTime={query}&endDateTime={query}", headers=headers)
-                owners = _reservation_owners(reservations, now)
-            for entry in entries:
-                resource = entry.get("resource") or {}
-                resource_id = resource.get("resourceId")
-                if resource_id is None:
-                    continue
-                state = _availability_state(resource.get("statusId"), bool(entry.get("available")))
-                db.execute(
-                    "UPDATE resource SET avail_state=?, avail_until=?, avail_at=?, reserved_by=?, avail_checked_at=datetime('now') WHERE id=?",
-                    (
-                        state,
-                        entry.get("availableUntil"),
-                        entry.get("availableAt"),
-                        owners.get(str(resource_id)) if state == "reserved" else None,
-                        resource_id,
-                    ),
-                )
+    paths = {
+        "availability": "/Resources/Availability",
+        "reservations": f"/Reservations/?startDateTime={query}&endDateTime={query}",
+    }
+    if include_resources:
+        paths["resources"] = "/Resources/"
+    with _booked_session() as headers, cf.ThreadPoolExecutor(len(paths)) as executor:
+        futures = {key: executor.submit(_call, path, headers=headers) for key, path in paths.items()}
+        cf.wait(futures.values())
+    snapshot: dict = {"now": now}
+    for key, future in futures.items():
+        try:
+            snapshot[key] = future.result()
+        except UserError:
+            # Owner names are cosmetic; let the rest of the refresh succeed.
+            if key != "reservations":
+                raise
+            snapshot[key] = None
+    if "resources" not in snapshot["availability"] and snapshot["reservations"] is None:
+        raise UserError("Booked Scheduler is unreachable or returned an invalid response. Check VPN/network access.")
+    return snapshot
+
+
+def apply_availability(db: sqlite3.Connection, snapshot: dict) -> None:
+    """Store availability from a fetch_booked() snapshot (main thread only)."""
+    now, payload, reservations = snapshot["now"], snapshot["availability"], snapshot["reservations"] or {}
+    if "resources" not in payload:
+        _fallback_availability(db, reservations, now)
+    else:
+        owners = _reservation_owners(reservations, now)
+        for entry in _availability_entries(payload):
+            resource = entry.get("resource") or {}
+            resource_id = resource.get("resourceId")
+            if resource_id is None:
+                continue
+            state = _availability_state(resource.get("statusId"), bool(entry.get("available")))
+            db.execute(
+                "UPDATE resource SET avail_state=?, avail_until=?, avail_at=?, reserved_by=?, avail_checked_at=datetime('now') WHERE id=?",
+                (
+                    state,
+                    entry.get("availableUntil"),
+                    entry.get("availableAt"),
+                    owners.get(str(resource_id)) if state == "reserved" else None,
+                    resource_id,
+                ),
+            )
     db.commit()
+
+
+def refresh_availability(db: sqlite3.Connection) -> None:
+    """Refresh all Booked resource availability with concurrent read-only GET requests."""
+    apply_availability(db, fetch_booked(include_resources=False))
 
 
 def cmd_sync_booked(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Replace Booked resource metadata and preserve the local probe cache."""
-    resources = booked_resources()
+    apply_booked(db, fetch_booked(include_resources=True))
+    return 0
+
+
+def apply_booked(db: sqlite3.Connection, snapshot: dict) -> None:
+    """Replace cached Booked resources and availability from one fetched snapshot."""
+    resources = snapshot["resources"]["resources"]
     db.execute("DELETE FROM resource_host")
     db.execute("DELETE FROM resource")
     for resource in resources:
@@ -301,10 +334,9 @@ def cmd_sync_booked(db: sqlite3.Connection, args: argparse.Namespace) -> int:
             # A formerly discovered host is authoritative Booked inventory once it appears here.
             db.execute("INSERT INTO host(name, source) VALUES (?, 'booked') ON CONFLICT(name) DO UPDATE SET source='booked'", (host,))
     db.commit()
-    refresh_availability(db)
+    apply_availability(db, snapshot)
     host_count = db.execute("SELECT count(DISTINCT host) FROM resource_host").fetchone()[0]
     print(f"Synced {len(resources)} resources, {host_count} hosts")
-    return 0
 
 
 # ---------------------------------------------------------------- SSH probe
@@ -312,6 +344,26 @@ def cmd_sync_booked(db: sqlite3.Connection, args: argparse.Namespace) -> int:
 # cannot hang the probe. No sudo is used (no password prompts, no privilege).
 REMOTE_SCRIPT = r"""
 export LC_ALL=C PATH=$PATH:/usr/sbin:/sbin
+# The slow external tools (lspci, lldpctl, and two opasmaquery calls per port)
+# start up front and run concurrently. Each writes into its own process
+# substitution, buffered in a variable so a timed-out or large output never
+# blocks on the pipe; results are read back below in the original fixed order.
+exec {lspci_fd}< <(o=$(timeout 10 lspci -Dnn -d 434e: 2>/dev/null); [ -n "$o" ] && printf '%s\n' "$o")
+exec {lldp_fd}< <(command -v lldpctl >/dev/null && o=$(timeout 10 lldpctl -f json 2>/dev/null) && [ -n "$o" ] && printf '%s\n' "$o")
+ports=(); sma_fds=()
+for d in /sys/class/infiniband/*; do [ -d "$d" ] || continue
+  [ "$(cat $d/device/vendor 2>/dev/null)" = "0x434e" ] || continue
+  dev=$(basename "$d"); pci=$(basename "$(readlink -f "$d/device")")
+  for p in "$d"/ports/*; do n=$(basename "$p")
+    ports+=("$dev|$n|$pci|$(cat $d/node_guid 2>/dev/null)|$(cat $p/state 2>/dev/null)|$(cat $p/phys_state 2>/dev/null)|$(cat $p/lid 2>/dev/null)")
+    idx=${dev##*_}; idx=$((idx+1))
+    exec {fd}< <(
+      o=$( (timeout 10 opasmaquery -o portinfo -h "$idx" -p "$n" 2>&1 | grep -E 'NeighborNodeType|NeighborNodeGuid|failed') &
+           timeout 10 opasmaquery -o nodeinfo -h "$idx" -p "$n" 2>/dev/null | grep -E '^\s*NodeGuid'; wait)
+      [ -n "$o" ] && printf '%s\n' "$o")
+    sma_fds+=("$fd")
+  done
+done
 echo "@@FQDN $(hostname -f 2>/dev/null || hostname)"
 echo "@@SYS"
 echo "SYS|vendor|$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)"
@@ -322,19 +374,14 @@ echo "SYS|sockets|$(grep '^physical id' /proc/cpuinfo 2>/dev/null | sort -u | wc
 echo "SYS|cores|$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)"
 echo "SYS|os|$(. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME")"
 echo "SYS|kernel|$(uname -r)"
-echo "@@LSPCI"; timeout 10 lspci -Dnn -d 434e: 2>/dev/null
+echo "@@LSPCI"; cat <&$lspci_fd
 echo "@@IB"
-for d in /sys/class/infiniband/*; do [ -d "$d" ] || continue
-  [ "$(cat $d/device/vendor 2>/dev/null)" = "0x434e" ] || continue
-  dev=$(basename "$d"); pci=$(basename "$(readlink -f "$d/device")")
-  for p in "$d"/ports/*; do n=$(basename "$p")
-    echo "PORT|$dev|$n|$pci|$(cat $d/node_guid 2>/dev/null)|$(cat $p/state 2>/dev/null)|$(cat $p/phys_state 2>/dev/null)|$(cat $p/lid 2>/dev/null)"
-    idx=${dev##*_}; idx=$((idx+1))
-    echo "@@SMA|$dev|$n"
-    timeout 10 opasmaquery -o portinfo -h "$idx" -p "$n" 2>&1 | grep -E 'NeighborNodeType|NeighborNodeGuid|failed'
-    timeout 10 opasmaquery -o nodeinfo -h "$idx" -p "$n" 2>/dev/null | grep -E '^\s*NodeGuid'
-    echo "@@END"
-  done
+for i in "${!ports[@]}"; do
+  IFS='|' read -r dev n _ <<< "${ports[$i]}"
+  echo "PORT|${ports[$i]}"
+  echo "@@SMA|$dev|$n"
+  cat <&${sma_fds[$i]}
+  echo "@@END"
 done
 echo "@@NET"
 for n in /sys/class/net/*; do [ -e "$n/device" ] || continue
@@ -342,14 +389,20 @@ for n in /sys/class/net/*; do [ -e "$n/device" ] || continue
   ven=$(cat "$n/device/vendor" 2>/dev/null)
   [ "$ven" = "0x434e" ] && [ "$(cat $n/type)" = "1" ] && echo "NET|$(basename $n)|$pci|$(cat $n/address)|$(cat $n/operstate)|$(cat $n/dev_port 2>/dev/null)"
 done
-echo "@@LLDP"
-command -v lldpctl >/dev/null && timeout 10 lldpctl -f json 2>/dev/null
+echo "@@LLDP"; cat <&$lldp_fd
 echo "@@DONE"
 """
 
 
-def ssh_probe(host: str, timeout: int) -> dict:
-    """Run the read-only inventory script over SSH and return its raw response."""
+def _ssh_run(host: str, script: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run a read-only script on host over SSH.
+
+    The script is passed as the remote command (``bash -c '<script>'``) with
+    stdin closed instead of being piped to ``bash -s``.  When ssh exits early
+    (auth or host-key failure) a stdin write would hit a closed pipe, and main()
+    restores the default SIGPIPE action, so that write killed the whole CLI
+    once enough sessions ran concurrently.
+    """
     command = [
         "ssh",
         "-o",
@@ -359,10 +412,15 @@ def ssh_probe(host: str, timeout: int) -> dict:
         "-o",
         "StrictHostKeyChecking=accept-new",
         host,
-        "bash -s",
+        "bash -c " + shlex.quote(script),
     ]
+    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+
+
+def ssh_probe(host: str, timeout: int) -> dict:
+    """Run the read-only inventory script over SSH and return its raw response."""
     try:
-        process = subprocess.run(command, input=REMOTE_SCRIPT, capture_output=True, text=True, timeout=timeout)
+        process = _ssh_run(host, REMOTE_SCRIPT, timeout)
     except subprocess.TimeoutExpired:
         return {"host": host, "error": "timeout"}
     if "@@DONE" not in process.stdout:
@@ -539,58 +597,94 @@ def store_probe(db: sqlite3.Connection, result: dict) -> None:
         )
 
 
-def cmd_probe(db: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Probe explicit or stale hosts, retaining partial results after interruption."""
-    if args.hosts:
-        hosts = [host.lower() for host in args.hosts]
-    elif args.force:
-        hosts = [row[0] for row in db.execute("SELECT name FROM host ORDER BY name")]
-    else:
-        hosts = [
-            row[0]
-            for row in db.execute(
-                "SELECT name FROM host WHERE probed_at IS NULL OR probed_at < datetime('now', ?) "
-                "OR (reachable=1 AND cpu IS NULL AND os IS NULL) ORDER BY name",
-                (f"-{args.max_age} hours",),
-            )
-        ]
+def _stale_hosts(db: sqlite3.Connection, args: argparse.Namespace) -> list[str]:
+    """Return cached hosts due for a probe under --force/--max-age."""
+    if args.force:
+        return [row[0] for row in db.execute("SELECT name FROM host ORDER BY name")]
+    return [
+        row[0]
+        for row in db.execute(
+            "SELECT name FROM host WHERE probed_at IS NULL OR probed_at < datetime('now', ?) "
+            "OR (reachable=1 AND cpu IS NULL AND os IS NULL) ORDER BY name",
+            (f"-{args.max_age} hours",),
+        )
+    ]
+
+
+def _report_probe_plan(db: sqlite3.Connection, hosts: list[str], args: argparse.Namespace) -> bool:
+    """Explain how many hosts are skipped as fresh; return False if none need probing."""
+    total = db.execute("SELECT count(*) FROM host").fetchone()[0]
     if not hosts:
-        total = db.execute("SELECT count(*) FROM host").fetchone()[0]
         print("No hosts known; run 'update' first." if not total else f"All {total} hosts are fresh; use --force to re-probe.")
-        return 0
-    if not args.hosts and not args.force:
+        return False
+    if not args.force:
         # Explain the skip so a small batch is not mistaken for a bug.
-        total = db.execute("SELECT count(*) FROM host").fetchone()[0]
         print(
             f"Probing {len(hosts)} of {total} hosts ({total - len(hosts)} probed within the last "
             f"{args.max_age:g}h are cached; use --force to re-probe all, --max-age to change the window)",
             file=sys.stderr,
         )
+    return True
+
+
+def cmd_probe(db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Probe explicit or stale hosts, retaining partial results after interruption."""
+    if args.hosts:
+        hosts = [host.lower() for host in args.hosts]
+    else:
+        hosts = _stale_hosts(db, args)
+        if not _report_probe_plan(db, hosts, args):
+            return 0
     _probe_hosts(db, hosts, args, show_progress=getattr(args, "discover", False))
     return 0
 
 
+class _ProbeTracker:
+    """Store and report probe results on the thread that owns the SQLite connection."""
+
+    def __init__(self, db: sqlite3.Connection, show_progress: bool) -> None:
+        self.db, self.show_progress = db, show_progress
+        self.submitted: dict[str, cf.Future] = {}
+        self.completed = self.reachable = 0
+
+    def submit(self, executor: cf.Executor, hosts: list[str], timeout: int) -> set[cf.Future]:
+        """Start probes for hosts not already in flight; return the new futures."""
+        new: set[cf.Future] = set()
+        for host in hosts:
+            if host not in self.submitted:
+                self.db.execute("INSERT OR IGNORE INTO host(name) VALUES (?)", (host,))
+                self.submitted[host] = future = executor.submit(ssh_probe, host, timeout)
+                new.add(future)
+        self.db.commit()
+        return new
+
+    def record(self, result: dict) -> None:
+        """Commit each result immediately so Ctrl-C loses less work."""
+        store_probe(self.db, result)
+        self.db.commit()
+        self.completed += 1
+        self.reachable += "error" not in result
+        total = len(self.submitted)
+        if self.show_progress:
+            progress(self.completed, total, "probe", result["host"])
+        else:
+            status = "ok" if "error" not in result else "FAIL: " + result["error"]
+            print(f"  [{self.completed}/{total}] {result['host']:<28} {status}", file=sys.stderr)
+
+    def summary(self) -> None:
+        print(f"Probed {len(self.submitted)} hosts, {self.reachable} reachable")
+
+
 def _probe_hosts(db: sqlite3.Connection, hosts: list[str], args: argparse.Namespace, show_progress: bool = False) -> None:
     """Probe hosts concurrently and commit each result so Ctrl-C loses less work."""
-    for host in hosts:
-        db.execute("INSERT OR IGNORE INTO host(name) VALUES (?)", (host,))
-    reachable = completed = 0
+    tracker = _ProbeTracker(db, show_progress)
     with cf.ThreadPoolExecutor(args.jobs) as executor:
-        futures = [executor.submit(ssh_probe, host, args.timeout) for host in hosts]
+        futures = tracker.submit(executor, hosts, args.timeout)
         if show_progress:
             progress(0, len(hosts), "probe")
         for future in cf.as_completed(futures):
-            result = future.result()
-            store_probe(db, result)
-            completed += 1
-            reachable += "error" not in result
-            db.commit()
-            if show_progress:
-                progress(completed, len(hosts), "probe", result["host"])
-            else:
-                status = "ok" if "error" not in result else "FAIL: " + result["error"]
-                print(f"  [{completed}/{len(hosts)}] {result['host']:<28} {status}", file=sys.stderr)
-    print(f"Probed {len(hosts)} hosts, {reachable} reachable")
+            tracker.record(future.result())
+    tracker.summary()
 
 
 # ---------------------------------------------------------------- discovery
@@ -637,19 +731,8 @@ def run_parallel(func: Callable[[str], tuple[str, list[dict]]], items: list[str]
 
 def _sa_query(host: str, timeout: int) -> tuple[str, list[dict]]:
     """Query node records from a host's fabric SA without making configuration changes."""
-    command = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=8",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        host,
-        "bash -s",
-    ]
     try:
-        process = subprocess.run(command, input=DISCOVER_SCRIPT, capture_output=True, text=True, timeout=timeout)
+        process = _ssh_run(host, DISCOVER_SCRIPT, timeout)
     except subprocess.TimeoutExpired:
         return host, []
     nodes: list[dict] = []
@@ -905,9 +988,39 @@ def cmd_discover(db: sqlite3.Connection, args: argparse.Namespace) -> int:
 
 
 def cmd_update(db: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Refresh Booked data, probe stale hosts, and optionally discover fabric hosts."""
-    cmd_sync_booked(db, args)
-    cmd_probe(db, args)
+    """Refresh Booked data, probe stale hosts, and optionally discover fabric hosts.
+
+    The Booked fetch and the SSH probes are independent network waits, so they
+    overlap: hosts already cached as stale start probing immediately while Booked
+    is fetched on its own thread, and hosts that first appear in Booked join the
+    same SSH pool as soon as the sync is stored. All SQLite writes stay on this
+    thread. Discovery still runs last because it needs the fresh probe results.
+    """
+    tracker = _ProbeTracker(db, show_progress=getattr(args, "discover", False))
+    booked_error: UserError | None = None
+    with cf.ThreadPoolExecutor(1) as booked_pool, cf.ThreadPoolExecutor(args.jobs) as ssh_pool:
+        booked = booked_pool.submit(fetch_booked, True)
+        pending: set[cf.Future] = tracker.submit(ssh_pool, _stale_hosts(db, args), args.timeout)
+        pending.add(booked)
+        while pending:
+            done, pending = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
+            for future in done:
+                if future is not booked:
+                    tracker.record(future.result())
+                    continue
+                try:
+                    apply_booked(db, future.result())
+                except UserError as error:
+                    # Keep probing the cached hosts; report the Booked failure afterwards.
+                    booked_error = error
+                    continue
+                stale = _stale_hosts(db, args)
+                pending |= tracker.submit(ssh_pool, stale, args.timeout)
+                _report_probe_plan(db, sorted(tracker.submitted), args)
+    if tracker.submitted:
+        tracker.summary()
+    if booked_error is not None:
+        raise booked_error
     if getattr(args, "discover", False):
         cmd_discover(db, args)
     return 0
@@ -1680,7 +1793,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     def probe_options(command: argparse.ArgumentParser) -> None:
-        command.add_argument("--jobs", type=int, default=16, help="parallel SSH sessions (default: 16)")
+        command.add_argument("--jobs", type=int, default=128, help="parallel SSH sessions (default: 128)")
         command.add_argument("--timeout", type=int, default=60, help="per-host timeout in seconds (default: 60)")
         command.add_argument("--max-age", type=float, default=24, metavar="HOURS", help="probe cache freshness window (default: 24)")
         command.add_argument("--force", action="store_true", help="ignore cached probes")
@@ -1711,7 +1824,7 @@ def build_parser() -> argparse.ArgumentParser:
         help_text="Discover unbooked fabric hosts using read-only SA queries.",
         examples="cnhwinv discover --jobs 8",
     )
-    discover.add_argument("--jobs", type=int, default=16, help="parallel SA queries (default: 16)")
+    discover.add_argument("--jobs", type=int, default=128, help="parallel SSH sessions for SA queries and probes (default: 128)")
     discover.add_argument("--timeout", type=int, default=60, help="per-host timeout in seconds (default: 60)")
 
     status = _subparser(

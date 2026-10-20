@@ -10,6 +10,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -144,7 +145,11 @@ CN-HOST01
         self.assertEqual(result, {"host": "cn-host01", "out": "@@DONE\n"})
         command = run.call_args.args[0]
         self.assertEqual(command[0], "ssh")
-        self.assertEqual(run.call_args.kwargs["input"], bi.REMOTE_SCRIPT)
+        # Script travels as the remote command with stdin closed, so an early
+        # ssh exit can never SIGPIPE the CLI on a stdin write.
+        self.assertEqual(command[-1], "bash -c " + bi.shlex.quote(bi.REMOTE_SCRIPT))
+        self.assertIs(run.call_args.kwargs["stdin"], bi.subprocess.DEVNULL)
+        self.assertNotIn("input", run.call_args.kwargs)
         self.assertNotIn("sudo", bi.REMOTE_SCRIPT)
 
     def test_booked_transport_error_is_a_friendly_user_error(self) -> None:
@@ -375,7 +380,9 @@ opasmaquery: failed to open port: Device or resource busy
             },
         ]
 
-        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(bi, "_call", side_effect=responses) as call, mock.patch.object(
+        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(
+            bi, "_call", side_effect=lambda path, **_: responses[0] if path.startswith("/Resources/Availability") else responses[1]
+        ) as call, mock.patch.object(
             bi, "datetime"
         ) as clock:
             session.return_value.__enter__.return_value = {"X-Booked-SessionToken": "token"}
@@ -405,7 +412,9 @@ opasmaquery: failed to open port: Device or resource busy
             },
         ]
 
-        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(bi, "_call", side_effect=responses) as call, mock.patch.object(
+        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(
+            bi, "_call", side_effect=lambda path, **_: responses[0] if path.startswith("/Resources/Availability") else responses[1]
+        ) as call, mock.patch.object(
             bi, "datetime"
         ) as clock:
             session.return_value.__enter__.return_value = {"X-Booked-SessionToken": "token"}
@@ -416,6 +425,76 @@ opasmaquery: failed to open port: Device or resource busy
         self.assertEqual(call.call_count, 2)
         state, owner = self.db.execute("SELECT avail_state, reserved_by FROM resource WHERE id=1").fetchone()
         self.assertEqual((state, owner), ("reserved", "Ada Lovelace"))
+
+    def update_args(self) -> argparse.Namespace:
+        return argparse.Namespace(jobs=4, timeout=5, max_age=24, force=False, discover=False)
+
+    def test_update_probes_cached_stale_hosts_while_booked_fetch_is_pending(self) -> None:
+        self.add_host("stale01")
+        self.add_host("fresh01")
+        self.db.execute("UPDATE host SET probed_at=datetime('now', '-2 days') WHERE name='stale01'")
+        self.db.commit()
+        probed_before_booked = threading.Event()
+        probed: list[str] = []
+
+        def slow_fetch(include_resources: bool) -> dict:
+            # Booked must not gate the cached stale probe: wait until it has run.
+            self.assertTrue(include_resources)
+            self.assertTrue(probed_before_booked.wait(5))
+            return {"snapshot": True}
+
+        def apply(db: sqlite3.Connection, snapshot: dict) -> None:
+            db.execute("INSERT INTO host(name, source) VALUES ('new01', 'booked')")
+            db.commit()
+
+        def probe(host: str, timeout: int) -> dict:
+            probed.append(host)
+            if host == "stale01":
+                probed_before_booked.set()
+            return {"host": host, "error": "unreachable"}
+
+        with mock.patch.object(bi, "fetch_booked", side_effect=slow_fetch), mock.patch.object(
+            bi, "apply_booked", side_effect=apply
+        ), mock.patch.object(bi, "ssh_probe", side_effect=probe), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            self.assertEqual(bi.cmd_update(self.db, self.update_args()), 0)
+
+        self.assertEqual(sorted(probed), ["new01", "stale01"])
+        self.assertEqual(probed[0], "stale01")
+
+    def test_update_still_probes_when_booked_fails_then_reports_error(self) -> None:
+        self.add_host("stale01")
+        self.db.execute("UPDATE host SET probed_at=datetime('now', '-2 days')")
+        self.db.commit()
+        probed: list[str] = []
+
+        def probe(host: str, timeout: int) -> dict:
+            probed.append(host)
+            return {"host": host, "error": "unreachable"}
+
+        with mock.patch.object(bi, "fetch_booked", side_effect=bi.UserError("booked down")), mock.patch.object(
+            bi, "ssh_probe", side_effect=probe
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(bi.UserError):
+                bi.cmd_update(self.db, self.update_args())
+
+        self.assertEqual(probed, ["stale01"])
+
+    def test_fetch_booked_issues_gets_concurrently(self) -> None:
+        barrier = threading.Barrier(3, timeout=5)
+
+        def call(path: str, **_: object) -> dict:
+            # Each GET blocks until all three are in flight; serial calls would time out.
+            barrier.wait()
+            return {"resources": []} if path.startswith("/Resources/") else {"reservations": []}
+
+        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(bi, "_call", side_effect=call):
+            session.return_value.__enter__.return_value = {"X-Booked-SessionToken": "token"}
+            snapshot = bi.fetch_booked(True)
+
+        self.assertIsNotNone(snapshot["resources"])
+        self.assertIsNotNone(snapshot["reservations"])
 
     def test_list_offline_skips_availability_refresh_and_falls_back_after_failure(self) -> None:
         self.add_host("cached01")

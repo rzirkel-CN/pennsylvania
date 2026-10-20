@@ -29,7 +29,10 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 # See cache coverage and its age, without a network call.
 ./cnhwinv status
 
-# Refresh Booked metadata and read-only probe stale hosts.
+# Refresh Booked metadata and read-only probe stale hosts. Cached stale hosts
+# start probing while Booked is fetched (its GETs run concurrently), new Booked
+# hosts join the same SSH pool (--jobs, default 128), and each host runs its
+# lspci/lldpctl/opasmaquery checks in parallel.
 ./cnhwinv update --max-age 24
 ./cnhwinv refresh --discover
 
