@@ -8,6 +8,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -56,6 +57,10 @@ class TtyBuffer(io.StringIO):
         return True
 
 
+REAL_BMC_POWER = bi.bmc_power
+BMC_ENV = {"CNHWINV_BMC_USER": "testuser", "CNHWINV_BMC_PASSWORD": "testpass"}
+
+
 class InventoryTestCase(unittest.TestCase):
     """Each test gets an independent SQLite cache outside the real XDG cache."""
 
@@ -63,6 +68,10 @@ class InventoryTestCase(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tempdir.name) / "inventory.db"
         self.db = bi.open_db(self.db_path)
+        # Never reach real BMCs from tests; individual tests override this stub.
+        bmc = mock.patch.object(bi, "bmc_power", side_effect=lambda host: {"bmc": bi.bmc_name(host), "power": None, "error": "stubbed"})
+        self.bmc_power = bmc.start()
+        self.addCleanup(bmc.stop)
 
     def tearDown(self) -> None:
         self.db.close()
@@ -137,6 +146,89 @@ Host Interface: HFI 1, Port 2
 CN-HOST01
 """
         self.assertEqual(bi.parse_hosts(raw), ["cn-host01", "cn-host02"])
+
+    def test_show_host_reports_bmc_power(self) -> None:
+        self.add_host("pwr01")
+        self.bmc_power.side_effect = lambda host: {"bmc": "pwr01-bmc", "power": "on", "error": None}
+        with mock.patch.object(bi, "_refresh_show_availability"):
+            code, text, _ = self.run_cli("show", "pwr01")
+        self.assertEqual(code, 0)
+        self.assertIn("Power (BMC pwr01-bmc): on", text)
+
+    def test_show_resource_queries_all_mapped_bmcs_and_json_includes_power(self) -> None:
+        self.add_host("pwr01")
+        self.add_host("pwr02")
+        self.add_resource(9, "Power rack", ["pwr01", "pwr02"])
+        states = {"pwr01": "on", "pwr02": "off"}
+        self.bmc_power.side_effect = lambda host: {"bmc": host + "-bmc", "power": states[host], "error": None}
+        with mock.patch.object(bi, "_refresh_show_availability"):
+            code, text, _ = self.run_cli("show", "power rack")
+            self.assertIn("pwr01  gen=-  reachable=yes  power=on", text)
+            self.assertIn("pwr02  gen=-  reachable=yes  power=off", text)
+            code, text, _ = self.run_cli("show", "power rack", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual([h["power"]["power"] for h in json.loads(text)["mapped_hosts"]], ["on", "off"])
+
+    def test_show_offline_and_no_power_skip_bmc(self) -> None:
+        self.add_host("pwr01")
+        for flags in (("--offline",), ("--no-power",)):
+            with mock.patch.object(bi, "_refresh_show_availability"):
+                code, text, _ = self.run_cli("show", "pwr01", *flags)
+            self.assertEqual(code, 0)
+            self.assertNotIn("Power", text)
+        self.bmc_power.assert_not_called()
+
+    def test_bmc_power_parses_ipmitool_and_hides_password(self) -> None:
+        done = subprocess.CompletedProcess([], 0, "Chassis Power is on\n", "")
+        with mock.patch.dict(os.environ, BMC_ENV), mock.patch.object(bi.socket, "getaddrinfo"), mock.patch.object(
+            bi.subprocess, "run", return_value=done
+        ) as run:
+            result = REAL_BMC_POWER("cn123.cornelisnetworks.com")
+        self.assertEqual(result, {"bmc": "cn123-bmc", "power": "on", "error": None})
+        command = run.call_args.args[0]
+        self.assertEqual(command[-3:], ["chassis", "power", "status"])
+        self.assertIn("-E", command)
+        self.assertEqual(command[command.index("-U") + 1], "testuser")
+        self.assertNotIn("testpass", command)
+        self.assertEqual(run.call_args.kwargs["env"]["IPMI_PASSWORD"], "testpass")
+
+    def test_bmc_power_requires_credentials_from_environment(self) -> None:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CNHWINV_BMC_")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(bi.socket, "getaddrinfo"), mock.patch.object(
+            bi.subprocess, "run"
+        ) as run:
+            result = REAL_BMC_POWER("cn123")
+        self.assertIn("CNHWINV_BMC_PASSWORD", result["error"])
+        run.assert_not_called()
+
+    def test_ssh_run_replaces_changed_host_key_and_retries(self) -> None:
+        bad = subprocess.CompletedProcess([], 255, "", "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.\n")
+        good = subprocess.CompletedProcess([], 0, "@@DONE\n", "")
+        config = subprocess.CompletedProcess([], 0, "hostname cn1.example.com\nuserknownhostsfile /kh\n", "")
+        calls = []
+
+        def fake_run(command, **_):
+            calls.append(command)
+            if command[:2] == ["ssh", "-G"]:
+                return config
+            if command[0] == "ssh-keygen":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return bad if sum(c[0] == "ssh" and c[1] != "-G" for c in calls) == 1 else good
+
+        with mock.patch.object(bi.subprocess, "run", side_effect=fake_run), mock.patch.object(bi.Path, "is_file", return_value=True):
+            result = bi.ssh_probe("cn1", 30)
+        self.assertEqual(result, {"host": "cn1", "out": "@@DONE\n"})
+        removed = [c for c in calls if c[0] == "ssh-keygen"]
+        self.assertEqual(removed, [["ssh-keygen", "-R", "cn1", "-f", "/kh"], ["ssh-keygen", "-R", "cn1.example.com", "-f", "/kh"]])
+
+    def test_bmc_power_reports_missing_dns_and_errors(self) -> None:
+        with mock.patch.object(bi.socket, "getaddrinfo", side_effect=OSError):
+            self.assertEqual(REAL_BMC_POWER("nobmc01")["error"], "no BMC DNS entry")
+        failed = subprocess.CompletedProcess([], 1, "", "Error: Unable to establish IPMI v2 / RMCP+ session\n")
+        with mock.patch.dict(os.environ, BMC_ENV), mock.patch.object(bi.socket, "getaddrinfo"), mock.patch.object(bi.subprocess, "run", return_value=failed):
+            result = REAL_BMC_POWER("dead01")
+        self.assertIsNone(result["power"])
+        self.assertIn("Unable to establish", result["error"])
 
     def test_ssh_probe_uses_mocked_subprocess_and_read_only_script(self) -> None:
         process = mock.Mock(stdout="@@DONE\n", stderr="")
@@ -968,6 +1060,124 @@ opasmaquery: failed to open port: Device or resource busy
         for command in forbidden:
             with self.subTest(command=command):
                 self.assertNotRegex(scripts, command)
+
+    # ------------------------------------------------------------ checkout/checkin
+    def booked_writes(self, responses: dict[str, object]):
+        """Patch the Booked session and record every _call made through it."""
+        calls: list[tuple[str, object, str | None]] = []
+
+        def fake_call(path, data=None, headers=None, method=None):
+            calls.append((path, data, method))
+            for prefix, response in responses.items():
+                if path.startswith(prefix):
+                    return response
+            return {}
+
+        session = mock.patch.object(bi, "_booked_session")
+        started = session.start()
+        self.addCleanup(session.stop)
+        started.return_value.__enter__.return_value = {"X-Booked-SessionToken": "t", "X-Booked-UserId": "251"}
+        call = mock.patch.object(bi, "_call", side_effect=fake_call)
+        call.start()
+        self.addCleanup(call.stop)
+        refresh = mock.patch.object(bi, "refresh_availability")
+        refresh.start()
+        self.addCleanup(refresh.stop)
+        return calls
+
+    def test_parse_duration_accepts_units_and_rejects_garbage(self) -> None:
+        self.assertEqual(bi._parse_duration("90m").total_seconds(), 5400)
+        self.assertEqual(bi._parse_duration("4").total_seconds(), 4 * 3600)
+        self.assertEqual(bi._parse_duration("2d").total_seconds(), 2 * 86400)
+        for bad in ("4x", "", "-1h", "0h"):
+            with self.subTest(value=bad), self.assertRaises(argparse.ArgumentTypeError):
+                bi._parse_duration(bad)
+
+    def test_resolve_resource_by_name_host_and_reports_ambiguity(self) -> None:
+        self.add_resource(10, "CN-B2B-07", ["cn-b2b-07a.cornelisnetworks.com"])
+        self.add_resource(11, "CN-B2B-08", ["cn-b2b-08a.cornelisnetworks.com"])
+        self.assertEqual(bi._resolve_resource(self.db, "CN-B2B-07"), (10, "CN-B2B-07"))
+        self.assertEqual(bi._resolve_resource(self.db, "cn-b2b-08a"), (11, "CN-B2B-08"))
+        with self.assertRaisesRegex(bi.UserError, "CN-B2B-07"):
+            bi._resolve_resource(self.db, "b2b")
+        with self.assertRaises(bi.UserError):
+            bi._resolve_resource(self.db, "nothing-like-it")
+
+    def test_checkout_dry_run_does_not_contact_booked(self) -> None:
+        self.add_resource(10, "CN-B2B-07", ["cn-b2b-07a"])
+        with mock.patch.object(bi, "_booked_session") as session, mock.patch.object(bi, "_call") as call:
+            code, out, _ = self.run_cli("checkout", "cn-b2b-07a", "--for", "90m", "-n")
+        self.assertEqual(code, 0)
+        self.assertIn("Would check out CN-B2B-07 (resource 10)", out)
+        session.assert_not_called()
+        call.assert_not_called()
+
+    def test_checkout_posts_reservation_for_current_user(self) -> None:
+        self.add_resource(10, "CN-B2B-07", ["cn-b2b-07a"])
+        calls = self.booked_writes({"/Reservations/": {"referenceNumber": "abc123", "isPendingApproval": False}})
+        code, out, _ = self.run_cli("checkout", "CN-B2B-07", "--for", "2h", "--json")
+        self.assertEqual(code, 0)
+        path, payload, method = calls[0]
+        self.assertEqual((path, method), ("/Reservations/", None))
+        self.assertEqual(payload["resourceId"], 10)
+        self.assertEqual(payload["userId"], 251)
+        start = datetime.fromisoformat(payload["startDateTime"])
+        end = datetime.fromisoformat(payload["endDateTime"])
+        self.assertEqual((end - start).total_seconds(), 7200)
+        self.assertEqual(json.loads(out)["reference"], "abc123")
+
+    def test_checkout_rejects_end_before_start(self) -> None:
+        self.add_resource(10, "CN-B2B-07", ["cn-b2b-07a"])
+        code, _, err = self.run_cli("checkout", "CN-B2B-07", "--start", "2030-01-01T10:00", "--until", "2030-01-01T09:00", "-n")
+        self.assertEqual(code, 2)
+        self.assertIn("End time must be after", err)
+
+    def reservation(self, reference: str, hours: int = 1) -> dict[str, object]:
+        start = datetime.now().astimezone()
+        return {
+            "referenceNumber": reference,
+            "resourceId": 10,
+            "resourceName": "CN-B2B-07",
+            "userId": 251,
+            "startDate": start.isoformat(),
+            "endDate": start.replace(year=start.year + 1).isoformat() if hours else start.isoformat(),
+        }
+
+    def test_checkin_releases_single_reservation_with_delete(self) -> None:
+        self.add_resource(10, "CN-B2B-07", ["cn-b2b-07a"])
+        calls = self.booked_writes({"/Reservations/?": {"reservations": [self.reservation("ref1")]}})
+        code, out, _ = self.run_cli("checkin", "cn-b2b-07a")
+        self.assertEqual(code, 0, out)
+        self.assertIn("released ref1", out)
+        deletes = [(path, method) for path, _, method in calls if method == "DELETE"]
+        self.assertEqual(deletes, [("/Reservations/ref1?updateScope=this", "DELETE")])
+
+    def test_checkin_requires_ref_or_all_when_several_reservations(self) -> None:
+        self.add_resource(10, "CN-B2B-07", ["cn-b2b-07a"])
+        reservations = {"reservations": [self.reservation("ref1"), self.reservation("ref2")]}
+        calls = self.booked_writes({"/Reservations/?": reservations})
+        code, _, err = self.run_cli("checkin", "CN-B2B-07")
+        self.assertEqual(code, 2)
+        self.assertIn("--ref or --all", err)
+        self.assertFalse([c for c in calls if c[2] == "DELETE"])
+        code, out, _ = self.run_cli("checkin", "CN-B2B-07", "--ref", "ref2")
+        self.assertEqual(code, 0)
+        self.assertEqual([c[0] for c in calls if c[2] == "DELETE"], ["/Reservations/ref2?updateScope=this"])
+
+    def test_checkin_without_name_only_lists(self) -> None:
+        calls = self.booked_writes({"/Reservations/?": {"reservations": [self.reservation("ref1")]}})
+        code, out, _ = self.run_cli("checkin")
+        self.assertEqual(code, 0)
+        self.assertIn("ref1", out)
+        self.assertFalse([c for c in calls if c[2] == "DELETE"])
+
+    def test_call_surfaces_booked_rejection_messages(self) -> None:
+        error = bi.urllib.error.HTTPError(
+            "http://x", 400, "Bad Request", {}, io.BytesIO(b'{"errors":["Missing or invalid resourceId"]}')
+        )
+        with mock.patch.object(bi.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(bi.UserError, "Booked rejected the request: Missing or invalid resourceId"):
+                bi._call("/Reservations/", {})
 
 
 if __name__ == "__main__":

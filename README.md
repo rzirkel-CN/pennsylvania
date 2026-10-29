@@ -5,11 +5,34 @@ maintaining a local inventory of Booked Scheduler lab hosts and cached,
 read-only SSH fabric facts. `list` refreshes the cached Booked availability
 when its value is older than five minutes (unless `--offline` is passed); if a
 refresh fails it warns and uses the cached value with its age. The
-`show` follows the same five-minute availability refresh policy and supports
+`show` follows the same five-minute availability refresh policy, queries host
+BMCs for read-only power status, and supports
 `--offline`; `links` and `status` only read SQLite.
 `update`, `probe`, `discover`, and `sync-booked` are the commands that contact
-Booked or lab hosts. The remote scripts are read-only and are regression-tested
-against state-changing commands.
+Booked or lab hosts. Lab hosts are reimaged often, so when SSH reports a
+changed host key cnhwinv removes the stale `known_hosts` entry and retries
+once, accepting the new key. The remote scripts are read-only and are regression-tested
+against state-changing commands. `checkout` and `checkin` are the only commands
+that write to Booked (they create or delete your own reservations).
+
+## Checking out a resource
+
+`checkout` accepts a Booked resource name or any host mapped to it (exact,
+short, or unique partial match) and reserves it as the configured Booked user.
+
+```bash
+./cnhwinv checkout cn123 --for 4h          # now until +4h (default 8h)
+./cnhwinv checkout cn123 --until 17:30     # HH:MM (next occurrence) or ISO
+./cnhwinv checkout cn123 --start 2026-11-02T09:00 --for 2d --title "OPX bringup"
+./cnhwinv checkout cn123 --for 90m -n      # dry run: show what would be booked
+./cnhwinv checkin                          # list your reservations (next 30 days)
+./cnhwinv checkin cn123                    # release your reservation for it
+./cnhwinv checkin cn123 --ref <reference>  # pick one when you hold several
+```
+
+Durations accept `d`, `h`, and `m` units, combinable (`1h30m`); a bare number
+means hours.
+`reserve` and `release` are aliases.
 
 ## Setup
 
@@ -45,9 +68,14 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 ./cnhwinv ls --gen 5k -o csv > cn5000.csv   # also: -o tsv | jsonl | json
 
 # Host names are case-insensitive and support a unique partial match.
-# `show` prints all cached host/resource, adapter, port, LLDP, and Booked facts.
-./cnhwinv show cn123 --offline
+# `show` prints all cached host/resource, adapter, port, LLDP, and Booked facts,
+# plus live chassis power from each host's BMC (<short-host>-bmc, read-only
+# `ipmitool chassis power status`, queried in parallel for every mapped host).
+# BMC credentials come only from CNHWINV_BMC_USER / CNHWINV_BMC_PASSWORD
+# (export them in ~/.bashrc; never commit them). --no-power or --offline skips it.
+./cnhwinv show cn123
 ./cnhwinv show 'Rack A' --json
+./cnhwinv show 'Rack A' --no-power
 ./cnhwinv show 'Rack A' --offline
 
 # Cached fabric/Ethernet peer evidence and common-switch membership.

@@ -21,14 +21,16 @@ import os
 import re
 import shlex
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
@@ -72,13 +74,17 @@ TOP_DESCRIPTION = """Inspect the local Booked Scheduler inventory cache without 
 
 `update` refreshes Booked metadata and SSH-probes hosts. `list` refreshes only
 cached Booked availability when it is older than five minutes; use `--offline`
-to suppress that read-only refresh. Remote probes and discovery are strictly read-only."""
+to suppress that read-only refresh. Remote probes and discovery are strictly read-only;
+`show` also asks each host's BMC for chassis power status (read-only IPMI).
+`checkout` and `checkin` are the only commands that write to Booked."""
 TOP_EPILOG = """Common examples:
   cnhwinv status
   cnhwinv update --max-age 24
   cnhwinv ls --gen 6k --reachable -w
   cnhwinv list --available
   cnhwinv show cn123
+  cnhwinv checkout cn123 --for 4h
+  cnhwinv checkin cn123
   cnhwinv links --gen CN5000
   cnhwinv --db /tmp/inventory.db list --json
 """
@@ -144,18 +150,42 @@ def _creds() -> tuple[str, str]:
         raise UserError("Booked credentials file must define BOOKED_USERNAME and BOOKED_PASSWORD.") from error
 
 
-def _call(path: str, data: dict[str, str] | None = None, headers: dict[str, str] | None = None) -> dict:
+def _booked_rejection(error: urllib.error.HTTPError) -> str | None:
+    """Extract Booked's validation messages (e.g. a reservation conflict) from an HTTP error body."""
+    try:
+        body = json.loads(error.read() or b"{}")
+    except (OSError, ValueError):
+        return None
+    messages = body.get("errors") if isinstance(body, dict) else None
+    if not messages:
+        return None
+    return "; ".join(str(message) for message in messages)
+
+
+def _call(
+    path: str,
+    data: dict | None = None,
+    headers: dict[str, str] | None = None,
+    method: str | None = None,
+) -> dict:
     """Call the Booked REST API and turn transport failures into one clear error."""
     request = urllib.request.Request(
         BOOKED_API + path,
         data=json.dumps(data).encode() if data is not None else None,
         headers={"Content-Type": "application/json", **(headers or {})},
-        method="POST" if data is not None else "GET",
+        method=method or ("POST" if data is not None else "GET"),
     )
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            return json.load(response)
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raw = response.read()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as error:
+        # Write requests fail with 400 plus a JSON list of reasons; show those instead of a network hint.
+        rejection = _booked_rejection(error)
+        if rejection:
+            raise UserError(f"Booked rejected the request: {rejection}") from error
+        raise UserError("Booked Scheduler is unreachable or returned an invalid response. Check VPN/network access.") from error
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         raise UserError("Booked Scheduler is unreachable or returned an invalid response. Check VPN/network access.") from error
 
 
@@ -414,7 +444,113 @@ def _ssh_run(host: str, script: str, timeout: int) -> subprocess.CompletedProces
         host,
         "bash -c " + shlex.quote(script),
     ]
-    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    process = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    if process.returncode == 255 and _HOST_KEY_FAILURE.search(process.stderr or ""):
+        # Lab hosts are reimaged constantly, so a changed host key is expected
+        # rather than suspicious.  Drop the stale entry and retry once; the
+        # retry records the new key via accept-new.
+        _forget_host_key(host)
+        process = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    return process
+
+
+_HOST_KEY_FAILURE = re.compile(r"Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|Host key for \S+ has changed")
+# ssh-keygen -R rewrites known_hosts in place; serialize it across probe threads.
+_KNOWN_HOSTS_LOCK = threading.Lock()
+
+
+def _known_host_names(host: str) -> tuple[list[str], list[str]]:
+    """Return (names keys are stored under, user known_hosts files) for host per `ssh -G`."""
+    names, files = [host], []
+    try:
+        config = subprocess.run(["ssh", "-G", host], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        config = ""
+    for line in config.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("hostname", "hostkeyalias") and value and value != "none":
+            names.append(value)
+        elif key == "userknownhostsfile":
+            files.extend(value.split())
+    return list(dict.fromkeys(names)), files or [str(Path("~/.ssh/known_hosts").expanduser())]
+
+
+def _forget_host_key(host: str) -> None:
+    """Remove host's stale entries from the user's known_hosts files; never raises."""
+    names, files = _known_host_names(host)
+    with _KNOWN_HOSTS_LOCK:
+        for path in files:
+            if not Path(path).expanduser().is_file():
+                continue
+            for name in names:
+                try:
+                    subprocess.run(
+                        ["ssh-keygen", "-R", name, "-f", str(Path(path).expanduser())],
+                        stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+
+# BMC power is queried with read-only `chassis power status` only; nothing here
+# can change power state.  Lab BMCs answer at <short-host>-bmc with the
+# account from CNHWINV_BMC_USER / CNHWINV_BMC_PASSWORD.  Credentials are never
+# stored in this repository; set them in your shell profile.
+BMC_TIMEOUT = 15
+
+
+def bmc_name(host: str) -> str:
+    """Return the conventional BMC hostname for a lab host."""
+    return host.split(".", 1)[0] + "-bmc"
+
+
+def bmc_power(host: str, timeout: int = BMC_TIMEOUT) -> dict:
+    """Query a host's BMC for chassis power state; never raises."""
+    bmc = bmc_name(host)
+    result: dict = {"bmc": bmc, "power": None, "error": None}
+    try:
+        socket.getaddrinfo(bmc, None)
+    except OSError:
+        result["error"] = "no BMC DNS entry"
+        return result
+    user, password = os.environ.get("CNHWINV_BMC_USER"), os.environ.get("CNHWINV_BMC_PASSWORD")
+    if not user or not password:
+        result["error"] = "set CNHWINV_BMC_USER and CNHWINV_BMC_PASSWORD"
+        return result
+    # The password travels via IPMI_PASSWORD (-E) so it never appears in ps output.
+    env = dict(os.environ, IPMI_PASSWORD=password)
+    command = ["ipmitool", "-I", "lanplus", "-H", bmc, "-U", user, "-E", "-N", "3", "-R", "2", "chassis", "power", "status"]
+    try:
+        proc = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, env=env)
+    except FileNotFoundError:
+        result["error"] = "ipmitool not installed"
+        return result
+    except subprocess.TimeoutExpired:
+        result["error"] = "timeout"
+        return result
+    match = re.search(r"Chassis Power is (\w+)", proc.stdout)
+    if match:
+        result["power"] = match.group(1).lower()
+    else:
+        lines = [line for line in (proc.stderr or proc.stdout).splitlines() if line.strip()]
+        result["error"] = lines[-1][:200] if lines else f"ipmitool exited {proc.returncode}"
+    return result
+
+
+def bmc_power_many(hosts: Sequence[str], jobs: int = 32) -> dict[str, dict]:
+    """Query several BMCs concurrently, keyed by host."""
+    unique = list(dict.fromkeys(hosts))
+    if not unique:
+        return {}
+    with cf.ThreadPoolExecutor(max_workers=min(jobs, len(unique))) as pool:
+        return dict(zip(unique, pool.map(bmc_power, unique)))
+
+
+def _power_text(power: dict | None) -> str:
+    """Render a bmc_power result compactly."""
+    if not power:
+        return "-"
+    return power["power"] or f"unknown ({power['error']})"
 
 
 def ssh_probe(host: str, timeout: int) -> dict:
@@ -1618,7 +1754,8 @@ def _print_resource_detail(detail: dict, indent: str = "") -> None:
         print(f"{indent}  Mapped hosts:")
         for host in detail["mapped_hosts"]:
             reach = "unprobed" if host["reachable"] is None else ("yes" if host["reachable"] else "no")
-            print(f"{indent}    {host['host']}  gen={host['generation']}  reachable={reach}")
+            power = f"  power={_power_text(host['power'])}" if "power" in host else ""
+            print(f"{indent}    {host['host']}  gen={host['generation']}  reachable={reach}{power}")
 
 
 def _print_host_detail(detail: dict) -> None:
@@ -1629,6 +1766,9 @@ def _print_host_detail(detail: dict) -> None:
             print(f"  {label}: {detail[key]}")
     if detail["reachable"] is not None:
         print(f"  Reachable: {'yes' if detail['reachable'] else 'no'}")
+    if "power" in detail:
+        power = detail["power"]
+        print(f"  Power (BMC {power['bmc']}): {_power_text(power)}")
     if detail["adapters"]:
         print("  Adapters:")
         for adapter in detail["adapters"]:
@@ -1661,8 +1801,27 @@ def _refresh_show_availability(db: sqlite3.Connection, offline: bool) -> None:
         print(f"Warning: Booked availability refresh failed; using cached values ({_age(checked_at)}).", file=sys.stderr)
 
 
+def _show_detail(db: sqlite3.Connection, args: argparse.Namespace, kind: str, key) -> int:
+    """Build, optionally BMC-annotate, and print one host or resource detail."""
+    detail = _host_detail(db, key) if kind == "host" else _resource_detail(db, key)
+    if not (args.offline or args.no_power):
+        if kind == "host":
+            detail["power"] = bmc_power_many([detail["host"]])[detail["host"]]
+        else:
+            powers = bmc_power_many([host["host"] for host in detail["mapped_hosts"]])
+            for host in detail["mapped_hosts"]:
+                host["power"] = powers[host["host"]]
+    if args.json:
+        _json(detail)
+    elif kind == "host":
+        _print_host_detail(detail)
+    else:
+        _print_resource_detail(detail)
+    return 0
+
+
 def cmd_show(db: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Resolve host/resource names and show complete cache facts."""
+    """Resolve host/resource names and show complete cache facts plus live BMC power."""
     _refresh_show_availability(db, args.offline)
     query = args.host.strip().lower()
     hosts = [host for (host,) in db.execute("SELECT name FROM host ORDER BY name")]
@@ -1674,26 +1833,11 @@ def cmd_show(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     resource_matches = [resource for resource in resources if query in resource[1].lower()]
 
     if exact_hosts:
-        detail = _host_detail(db, exact_hosts[0])
-        if args.json:
-            _json(detail)
-        else:
-            _print_host_detail(detail)
-        return 0
+        return _show_detail(db, args, "host", exact_hosts[0])
     if len(short_hosts) == 1:
-        detail = _host_detail(db, short_hosts[0])
-        if args.json:
-            _json(detail)
-        else:
-            _print_host_detail(detail)
-        return 0
+        return _show_detail(db, args, "host", short_hosts[0])
     if exact_resources:
-        detail = _resource_detail(db, exact_resources[0][0])
-        if args.json:
-            _json(detail)
-        else:
-            _print_resource_detail(detail)
-        return 0
+        return _show_detail(db, args, "resource", exact_resources[0][0])
     if len(host_matches) > 1:
         raise UserError(f"{args.host!r} matches multiple hosts: {', '.join(host_matches)}")
     if len(resource_matches) > 1:
@@ -1702,19 +1846,9 @@ def cmd_show(db: sqlite3.Connection, args: argparse.Namespace) -> int:
         candidates = [host_matches[0], resource_matches[0][1]]
         raise UserError(f"{args.host!r} matches multiple cached items: {', '.join(candidates)}")
     if host_matches:
-        detail = _host_detail(db, host_matches[0])
-        if args.json:
-            _json(detail)
-        else:
-            _print_host_detail(detail)
-        return 0
+        return _show_detail(db, args, "host", host_matches[0])
     if resource_matches:
-        detail = _resource_detail(db, resource_matches[0][0])
-        if args.json:
-            _json(detail)
-        else:
-            _print_resource_detail(detail)
-        return 0
+        return _show_detail(db, args, "resource", resource_matches[0][0])
 
     names = hosts + [name for _, name in resources]
     suggestions = difflib.get_close_matches(query, names, n=5, cutoff=0.45)
@@ -1741,6 +1875,209 @@ def cmd_links(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     for group in groups:
         name = f" ({group['name']})" if group["name"] else ""
         print(f"  switch {group['guid']}{name}: {group['members']}")
+    return 0
+
+
+# ---------------------------------------------------------------- Booked checkout / checkin
+# These are the only code paths that write to Booked; everything else stays read-only.
+_DURATION_RE = re.compile(r"(\d+)\s*([dhm])", re.IGNORECASE)
+_DURATION_UNITS = {"d": 86400, "h": 3600, "m": 60}
+DEFAULT_CHECKOUT = "8h"
+
+
+def _parse_duration(value: str) -> timedelta:
+    """Parse '90m', '4h', '2d', or '1h30m' into a positive timedelta."""
+    text = value.strip().lower().replace(" ", "")
+    if text.isdigit():
+        # A bare number is hours; that is what people mean by "check it out for 4".
+        text += "h"
+    parts = _DURATION_RE.findall(text)
+    if not parts or "".join(f"{n}{u}" for n, u in parts) != text:
+        raise argparse.ArgumentTypeError(f"invalid duration {value!r}; use e.g. 30m, 4h, 2d, or 1h30m")
+    seconds = sum(int(number) * _DURATION_UNITS[unit] for number, unit in parts)
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("duration must be positive")
+    return timedelta(seconds=seconds)
+
+
+def _parse_when(value: str, now: datetime) -> datetime:
+    """Parse an ISO timestamp or HH:MM (next occurrence) as local time."""
+    text = value.strip()
+    clock = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if clock:
+        hour, minute = int(clock.group(1)), int(clock.group(2))
+        if hour > 23 or minute > 59:
+            raise UserError(f"invalid time {value!r}")
+        moment = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return moment if moment > now else moment + timedelta(days=1)
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise UserError(f"invalid time {value!r}; use HH:MM or YYYY-MM-DDTHH:MM") from error
+    return moment.astimezone() if moment.tzinfo else moment.replace(tzinfo=now.tzinfo)
+
+
+def _resolve_resource(db: sqlite3.Connection, query: str) -> tuple[int, str]:
+    """Map a resource name or host name (full, short, or unique partial) to one Booked resource."""
+    needle = query.strip().lower()
+    resources = list(db.execute("SELECT id, name FROM resource ORDER BY name"))
+    if not resources:
+        raise UserError("No Booked resources cached. Run `cnhwinv sync-booked` first.")
+
+    def host_resources(where: str, param: str) -> list[tuple[int, str]]:
+        return list(
+            db.execute(
+                "SELECT DISTINCT r.id, r.name FROM resource_host rh JOIN resource r ON r.id=rh.resource_id "
+                f"WHERE {where} ORDER BY r.name",
+                (param,),
+            )
+        )
+
+    exact = [resource for resource in resources if resource[1].lower() == needle]
+    if exact:
+        return exact[0]
+    for where, param in (
+        ("lower(rh.host)=?", needle),
+        ("lower(rh.host) LIKE ? ESCAPE '\\'", needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + ".%"),
+    ):
+        mapped = host_resources(where, param)
+        if len(mapped) == 1:
+            return mapped[0]
+        if len(mapped) > 1:
+            names = ", ".join(name for _, name in mapped)
+            raise UserError(f"Host {query!r} belongs to several Booked resources: {names}. Check out one by name.")
+    partial = [resource for resource in resources if needle in resource[1].lower()]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        raise UserError(f"{query!r} matches multiple Booked resources: {', '.join(name for _, name in partial)}")
+    hosts = {host for (host,) in db.execute("SELECT DISTINCT host FROM resource_host") if needle in host.lower()}
+    if len(hosts) == 1:
+        return _resolve_resource(db, hosts.pop())
+    if len(hosts) > 1:
+        raise UserError(f"{query!r} matches multiple hosts: {', '.join(sorted(hosts))}")
+    names = [name for _, name in resources] + [host for (host,) in db.execute("SELECT DISTINCT host FROM resource_host")]
+    suggestions = difflib.get_close_matches(needle, names, n=5, cutoff=0.45)
+    suffix = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    raise UserError(f"{query!r} is not a cached Booked resource or mapped host.{suffix}")
+
+
+def _booked_timestamp(moment: datetime) -> str:
+    return moment.astimezone().replace(microsecond=0).isoformat()
+
+
+def _my_reservations(headers: dict[str, str], now: datetime, resource_id: int | None, horizon: timedelta) -> list[dict]:
+    """Return the session user's reservations that have not ended yet (optionally for one resource)."""
+    params = {
+        "userId": headers["X-Booked-UserId"],
+        "startDateTime": _booked_timestamp(now),
+        "endDateTime": _booked_timestamp(now + horizon),
+    }
+    if resource_id is not None:
+        params["resourceId"] = str(resource_id)
+    payload = _call(f"/Reservations/?{urllib.parse.urlencode(params)}", headers=headers)
+    mine = []
+    for reservation in payload.get("reservations") or []:
+        end = _booked_datetime(reservation.get("endDate"))
+        if str(reservation.get("userId")) != headers["X-Booked-UserId"] or (end is not None and end <= now):
+            continue
+        if resource_id is not None and str(reservation.get("resourceId")) != str(resource_id):
+            continue
+        mine.append(reservation)
+    return sorted(mine, key=lambda reservation: reservation.get("startDate") or "")
+
+
+def _refresh_after_write(db: sqlite3.Connection) -> None:
+    """Keep the cached availability truthful after a write; a failure here is only a warning."""
+    try:
+        refresh_availability(db)
+    except UserError as error:
+        print(f"Warning: could not refresh cached availability: {error}", file=sys.stderr)
+
+
+def cmd_checkout(db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Create a Booked reservation for a resource (or the resource a host belongs to)."""
+    resource_id, resource_name = _resolve_resource(db, args.name)
+    now = datetime.now().astimezone().replace(second=0, microsecond=0)
+    start = _parse_when(args.start, now) if args.start else now
+    if args.until:
+        end = _parse_when(args.until, start)
+    else:
+        end = start + (args.duration or _parse_duration(DEFAULT_CHECKOUT))
+    if end <= start:
+        raise UserError("End time must be after the start time.")
+    request = {
+        "resourceId": resource_id,
+        "startDateTime": _booked_timestamp(start),
+        "endDateTime": _booked_timestamp(end),
+        "title": args.title or f"cnhwinv checkout: {resource_name}",
+        "description": args.description or "",
+    }
+    summary = {"resource_id": resource_id, "resource": resource_name, "start": request["startDateTime"], "end": request["endDateTime"]}
+    if args.dry_run:
+        if args.json:
+            _json({**summary, "dry_run": True})
+        else:
+            print(f"Would check out {resource_name} (resource {resource_id}) from {request['startDateTime']} until {request['endDateTime']}.")
+        return 0
+    with _booked_session() as headers:
+        request["userId"] = int(headers["X-Booked-UserId"])
+        result = _call("/Reservations/", request, headers=headers)
+    reference = result.get("referenceNumber")
+    if not reference:
+        message = result.get("message") or "no reference number returned"
+        raise UserError(f"Booked did not confirm the reservation: {message}")
+    summary.update(reference=reference, pending_approval=bool(result.get("isPendingApproval")))
+    _refresh_after_write(db)
+    if args.json:
+        _json(summary)
+        return 0
+    print(f"Checked out {resource_name} until {_full_booked_time(summary['end'])} (reference {reference}).")
+    if summary["pending_approval"]:
+        print("Note: this reservation is pending approval by a Booked administrator.")
+    return 0
+
+
+def cmd_checkin(db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Release your own Booked reservation(s) for a resource, or list what you have checked out."""
+    now = datetime.now().astimezone()
+    horizon = timedelta(days=args.days)
+    resource = _resolve_resource(db, args.name) if args.name else None
+    with _booked_session() as headers:
+        mine = _my_reservations(headers, now, resource[0] if resource else None, horizon)
+        if args.ref:
+            mine = [reservation for reservation in mine if reservation.get("referenceNumber") == args.ref]
+        if not args.name:
+            # Without a target this is a listing; never release anything implicitly.
+            if args.json:
+                _json({"reservations": mine})
+            elif not mine:
+                print(f"You have no Booked reservations in the next {args.days} days.")
+            else:
+                for reservation in mine:
+                    print(
+                        f"  {reservation.get('resourceName') or reservation.get('resourceId'):<28} "
+                        f"{_full_booked_time(reservation.get('startDate'))} -> {_full_booked_time(reservation.get('endDate'))}  "
+                        f"{reservation.get('referenceNumber')}"
+                    )
+            return 0
+        if not mine:
+            raise UserError(f"You have no current or upcoming reservation for {resource[1]}.")
+        if len(mine) > 1 and not (args.all or args.ref):
+            listing = ", ".join(
+                f"{reservation.get('referenceNumber')} ({_full_booked_time(reservation.get('startDate'))})" for reservation in mine
+            )
+            raise UserError(f"You have {len(mine)} reservations for {resource[1]}: {listing}. Use --ref or --all.")
+        released = []
+        for reservation in mine:
+            reference = reservation["referenceNumber"]
+            _call(f"/Reservations/{urllib.parse.quote(reference)}?updateScope=this", headers=headers, method="DELETE")
+            released.append(reference)
+    _refresh_after_write(db)
+    if args.json:
+        _json({"resource": resource[1], "released": released})
+    else:
+        print(f"Checked in {resource[1]} (released {', '.join(released)}).")
     return 0
 
 
@@ -1858,11 +2195,12 @@ def build_parser() -> argparse.ArgumentParser:
     show = _subparser(
         subparsers,
         "show",
-        help_text="Show complete cached facts; refreshes Booked availability older than five minutes unless --offline is used.",
-        examples="cnhwinv show cn123 --offline\n  cnhwinv show 'Rack A' --json\n  cnhwinv show 'Rack A' --offline",
+        help_text="Show complete cached facts plus live BMC power status; refreshes Booked availability older than five minutes unless --offline is used.",
+        examples="cnhwinv show cn123\n  cnhwinv show cn123 --offline\n  cnhwinv show 'Rack A' --json\n  cnhwinv show 'Rack A' --no-power",
     )
     show.add_argument("host", metavar="HOST_OR_RESOURCE", help="case-insensitive full or unique partial name")
-    show.add_argument("--offline", action="store_true", help="do not refresh Booked availability; use cached values only")
+    show.add_argument("--offline", action="store_true", help="cached values only: no Booked refresh and no BMC queries")
+    show.add_argument("--no-power", action="store_true", help="skip the read-only BMC chassis power query")
     show.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
     links = _subparser(
@@ -1874,6 +2212,36 @@ def build_parser() -> argparse.ArgumentParser:
     links.add_argument("--gen", type=_link_generation_argument, metavar="GEN", help="5k/6k/CN5000, or CN6000")
     links.add_argument("--json", action="store_true", help="shorthand for --format json")
     links.add_argument("--format", "-o", choices=TABLE_FORMATS, default="table", help="output format: table (default), json, jsonl, csv, or tsv")
+
+    checkout = _subparser(
+        subparsers,
+        "checkout",
+        aliases=["reserve"],
+        help_text=f"Reserve a Booked resource (by resource or host name) for yourself; default {DEFAULT_CHECKOUT} starting now.",
+        examples="cnhwinv checkout cn123\n  cnhwinv checkout 'Rack A' --for 2d\n  cnhwinv checkout cn123 --start 09:00 --until 17:00\n  cnhwinv checkout cn123 --for 90m --dry-run",
+    )
+    checkout.add_argument("name", metavar="HOST_OR_RESOURCE", help="resource name, or a host mapped to exactly one resource")
+    timing = checkout.add_mutually_exclusive_group()
+    timing.add_argument("--for", dest="duration", type=_parse_duration, metavar="DURATION", help=f"length, e.g. 30m, 4h, 2d, 1h30m (default: {DEFAULT_CHECKOUT})")
+    timing.add_argument("--until", metavar="TIME", help="end time: HH:MM (next occurrence) or YYYY-MM-DDTHH:MM")
+    checkout.add_argument("--start", metavar="TIME", help="start time: HH:MM or YYYY-MM-DDTHH:MM (default: now)")
+    checkout.add_argument("--title", help="reservation title (default: 'cnhwinv checkout: <resource>')")
+    checkout.add_argument("--description", help="reservation description")
+    checkout.add_argument("--dry-run", "-n", action="store_true", help="show what would be reserved without contacting Booked")
+    checkout.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    checkin = _subparser(
+        subparsers,
+        "checkin",
+        aliases=["release"],
+        help_text="Release your Booked reservation for a resource; with no name, list your reservations.",
+        examples="cnhwinv checkin\n  cnhwinv checkin cn123\n  cnhwinv checkin 'Rack A' --all",
+    )
+    checkin.add_argument("name", nargs="?", metavar="HOST_OR_RESOURCE", help="resource name, or a host mapped to exactly one resource")
+    checkin.add_argument("--ref", metavar="REFERENCE", help="release only this reservation reference number")
+    checkin.add_argument("--all", action="store_true", help="release every current/upcoming reservation you hold on the resource")
+    checkin.add_argument("--days", type=int, default=30, help="how far ahead to look for your reservations (default: 30)")
+    checkin.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     return parser
 
 
@@ -1920,6 +2288,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "ls": cmd_list,
         "show": cmd_show,
         "links": cmd_links,
+        "checkout": cmd_checkout,
+        "reserve": cmd_checkout,
+        "checkin": cmd_checkin,
+        "release": cmd_checkin,
     }
     if args.db == DEFAULT_DB and not DEFAULT_DB.exists() and LEGACY_DB.exists():
         # Carry the cache over from the pre-rename location instead of starting empty.
