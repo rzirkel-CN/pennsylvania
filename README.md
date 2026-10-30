@@ -61,6 +61,8 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 
 # Inspect the cache. `ls` and `list` are interchangeable.
 ./cnhwinv ls --gen 6k --reachable -w
+./cnhwinv list --gpu                        # hosts with PCIe-probed or Booked GPU metadata
+./cnhwinv list --gpu nvidia --available     # filter by GPU model/vendor/PCI ID substring
 ./cnhwinv list --source discovered --json
 ./cnhwinv list --available                  # every mapped Booked resource is free
 ./cnhwinv list --link down --gen 5k          # cached Cornelis HSN links with no ports up
@@ -68,7 +70,7 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 ./cnhwinv ls --gen 5k -o csv > cn5000.csv   # also: -o tsv | jsonl | json
 
 # Host names are case-insensitive and support a unique partial match.
-# `show` prints all cached host/resource, adapter, port, LLDP, and Booked facts,
+# `show` prints all cached host/resource, adapter, GPU, port, LLDP, and Booked facts,
 # plus live chassis power from each host's BMC (<short-host>-bmc, read-only
 # `ipmitool chassis power status`, queried in parallel for every mapped host).
 # BMC credentials come only from CNHWINV_BMC_USER / CNHWINV_BMC_PASSWORD

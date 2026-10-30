@@ -33,8 +33,11 @@ SYS|cores|64
 SYS|os|Rocky Linux 9.4
 SYS|kernel|5.14.0-test
 @@LSPCI
+0000:0b:00.0 3D controller [0302]: NVIDIA Corporation AD102GL [L40S] [10de:26b9] (rev a1)
+0000:35:00.0 VGA compatible controller [0300]: Matrox Electronics Systems Ltd. Integrated Matrox G200eW3 Graphics Controller [102b:0536] (rev 08)
 0000:41:00.0 Network controller [0280]: Cornelis Networks Inc CN5000 [434e:0001]
 0000:81:00.0 Network controller [0280]: Cornelis Networks Inc CN6000 [434e:0002]
+0001:0b:00.0 3D controller [0302]: NVIDIA Corporation AD102GL [L40S] [10de:26b9] (rev a1)
 @@IB
 PORT|hfi1_0|1|0000:41:00.0|00:11:22:33:44:55:66:77|4: ACTIVE|5: LinkUp|17
 @@SMA|hfi1_0|1
@@ -106,6 +109,24 @@ class InventoryTestCase(unittest.TestCase):
             "INSERT INTO adapter(host, pci_addr, device_id, generation, pci_class, description) "
             "VALUES (?, ?, ?, ?, 'Network controller', 'Cornelis adapter')",
             (host, pci, device, generation),
+        )
+        self.db.commit()
+
+    def add_gpu(
+        self,
+        host: str,
+        pci: str = "0000:0b:00.0",
+        *,
+        vendor_id: str = "10de",
+        device_id: str = "26b9",
+        pci_class: str = "3D controller",
+        model: str = "NVIDIA L40S",
+        description: str = "NVIDIA Corporation AD102GL [L40S]",
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO gpu(host, pci_addr, vendor_id, device_id, pci_class, model, description) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (host, pci, vendor_id, device_id, pci_class, model, description),
         )
         self.db.commit()
 
@@ -255,6 +276,7 @@ CN-HOST01
         self.assertEqual(parsed["fqdn"], "cn-host01.example.com")
         self.assertEqual(parsed["sys"]["cpu"], "Intel(R) Xeon(R) Gold 6430")
         self.assertEqual([adapter["gen"] for adapter in parsed["adapters"]], ["CN5000", "CN6000"])
+        self.assertEqual([gpu["model"] for gpu in parsed["gpus"]], ["NVIDIA L40S", "NVIDIA L40S"])
         self.assertEqual(parsed["ports"][0]["neighbor_guid"], "0x8899aabbccddeeff")
         self.assertEqual(parsed["ports"][0]["neighbor_port"], 2)
         self.assertEqual(parsed["net"][0]["netdev"], "ens1")
@@ -287,6 +309,8 @@ opasmaquery: failed to open port: Device or resource busy
         self.assertEqual(tuple(row), (1, "Cornelis Networks CN6000 Test Platform", "Intel(R) Xeon(R) Gold 6430", "Rocky Linux 9.4"))
         ports = self.db.execute("SELECT kind, ifname FROM port WHERE host='cn-host01' ORDER BY kind").fetchall()
         self.assertEqual([tuple(port) for port in ports], [("eth", "ens1"), ("opa", "hfi1_0")])
+        gpus = self.db.execute("SELECT pci_addr, vendor_id, model FROM gpu WHERE host='cn-host01' ORDER BY pci_addr").fetchall()
+        self.assertEqual([tuple(gpu) for gpu in gpus], [("0000:0b:00.0", "10de", "NVIDIA L40S"), ("0001:0b:00.0", "10de", "NVIDIA L40S")])
 
     def test_host_gen_classifies_single_mixed_and_unprobed_hosts(self) -> None:
         self.add_host("fivek01")
@@ -1178,6 +1202,91 @@ opasmaquery: failed to open port: Device or resource busy
         with mock.patch.object(bi.urllib.request, "urlopen", side_effect=error):
             with self.assertRaisesRegex(bi.UserError, "Booked rejected the request: Missing or invalid resourceId"):
                 bi._call("/Reservations/", {})
+
+    def test_gpu_model_and_host_gpu_summarize_probed_and_booked_gpus(self) -> None:
+        self.assertEqual(
+            bi._gpu_model("1002", "738c", "Advanced Micro Devices, Inc. [AMD/ATI] Arcturus GL-XL [Instinct MI100]"),
+            "AMD Instinct MI100",
+        )
+        self.assertEqual(bi._gpu_model("10de", "2900", "NVIDIA Corporation Device"), "NVIDIA [10de:2900]")
+        parsed = bi.parse_probe(
+            "@@LSPCI\n"
+            "0000:dd:00.0 Processing accelerators [1200]: Advanced Micro Devices, Inc. [AMD/ATI] Aqua Vanjaram [Instinct MI300X] [1002:74a1]\n"
+            "0000:00:02.0 VGA compatible controller [0300]: Intel Corporation UHD Graphics 770 [8086:4680]\n"
+            "0000:6a:00.0 Processing accelerators [1200]: Intel Corporation Device [8086:2710]\n"
+            "@@DONE\n"
+        )
+        self.assertEqual([gpu["model"] for gpu in parsed["gpus"]], ["AMD Instinct MI300X"])
+        self.add_host("dual01")
+        self.add_gpu("dual01", "0000:0b:00.0", model="NVIDIA L40S")
+        self.add_gpu("dual01", "0001:0b:00.0", model="NVIDIA L40S")
+        self.add_host("booked-gpu01", reachable=0)
+        self.add_resource(1, "GPU-DEV-02", ["booked-gpu01"])
+        self.db.execute("UPDATE resource SET attrs_json=? WHERE id=1", (json.dumps({"GPU": "Nvidia A40"}),))
+        self.add_host("placeholder01")
+        self.add_resource(2, "Placeholder", ["placeholder01"])
+        self.db.execute("UPDATE resource SET attrs_json=? WHERE id=2", (json.dumps({"GPU": "None"}),))
+        self.add_host("nogpu01")
+        self.db.commit()
+        self.assertEqual(bi.host_gpu(self.db, "dual01"), "2x NVIDIA L40S")
+        self.assertEqual(bi.host_gpu(self.db, "booked-gpu01"), "Nvidia A40")
+        self.assertEqual(bi.host_gpu(self.db, "placeholder01"), "-")
+        self.assertEqual(bi.host_gpu(self.db, "nogpu01"), "-")
+
+    def test_list_show_and_status_report_and_filter_gpus(self) -> None:
+        self.add_host("gpu-nv01")
+        self.add_adapter("gpu-nv01", "0000:01:00.0", "CN6000")
+        self.add_gpu("gpu-nv01", "0000:0b:00.0", model="NVIDIA L40S")
+        self.add_gpu("gpu-nv01", "0001:0b:00.0", model="NVIDIA L40S")
+        self.add_resource(1, "gpu_b2b_01", ["gpu-nv01"])
+        self.add_host("gpu-amd01")
+        self.add_gpu(
+            "gpu-amd01",
+            "0000:43:00.0",
+            vendor_id="1002",
+            device_id="738c",
+            pci_class="Display controller",
+            model="AMD Instinct MI100",
+            description="Advanced Micro Devices, Inc. [AMD/ATI] Arcturus GL-XL [Instinct MI100]",
+        )
+        self.add_host("cpu-only01")
+
+        code, text, _ = self.run_cli("list", "--offline", "--gpu")
+        self.assertEqual(code, 0)
+        self.assertIn("GPU", text.splitlines()[0])
+        self.assertIn("gpu-nv01", text)
+        self.assertIn("2x NVIDIA L40S", text)
+        self.assertIn("gpu-amd01", text)
+        self.assertIn("AMD Instinct MI100", text)
+        self.assertNotIn("cpu-only01", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "--gpu", "10de:26b9", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(text)
+        self.assertEqual([h["host"] for h in payload["hosts"]], ["gpu-nv01"])
+        self.assertEqual(payload["hosts"][0]["gpu"], "2x NVIDIA L40S")
+        self.assertEqual(payload["hosts"][0]["gpu_count"], 2)
+        self.assertEqual(payload["hosts"][0]["gpu_source"], "pcie")
+        self.assertEqual(payload["summary"]["gpu"], 1)
+
+        code, text, _ = self.run_cli("list", "--offline", "--gpu", "none")
+        self.assertEqual(code, 0)
+        self.assertIn("cpu-only01", text)
+        self.assertNotIn("gpu-nv01", text)
+
+        code, text, _ = self.run_cli("show", "gpu-nv01", "--offline")
+        self.assertEqual(code, 0)
+        self.assertIn("GPU: 2x NVIDIA L40S", text)
+        self.assertIn("GPUs:", text)
+        self.assertIn("0000:0b:00.0  NVIDIA L40S  [10de:26b9]", text)
+
+        code, text, _ = self.run_cli("show", "gpu_b2b_01", "--offline")
+        self.assertEqual(code, 0)
+        self.assertIn("gpu=2x NVIDIA L40S", text)
+
+        code, text, _ = self.run_cli("status")
+        self.assertEqual(code, 0)
+        self.assertIn("GPUs:    2 probed host(s) (3 PCIe device(s))", text)
 
 
 if __name__ == "__main__":
