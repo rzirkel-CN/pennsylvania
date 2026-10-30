@@ -38,6 +38,8 @@ SYS|kernel|5.14.0-test
 0000:41:00.0 Network controller [0280]: Cornelis Networks Inc CN5000 [434e:0001]
 0000:81:00.0 Network controller [0280]: Cornelis Networks Inc CN6000 [434e:0002]
 0001:0b:00.0 3D controller [0302]: NVIDIA Corporation AD102GL [L40S] [10de:26b9] (rev a1)
+PCIE|0000:0b:00.0|2.5 GT/s PCIe|16|16.0 GT/s PCIe|16
+PCIE|0001:0b:00.0|16.0 GT/s PCIe|16|16.0 GT/s PCIe|16
 @@IB
 PORT|hfi1_0|1|0000:41:00.0|00:11:22:33:44:55:66:77|4: ACTIVE|5: LinkUp|17
 @@SMA|hfi1_0|1
@@ -122,11 +124,15 @@ class InventoryTestCase(unittest.TestCase):
         pci_class: str = "3D controller",
         model: str = "NVIDIA L40S",
         description: str = "NVIDIA Corporation AD102GL [L40S]",
+        pcie_gen: str | None = "Gen4",
+        pcie_width: str | None = "x16",
+        pcie_cur: str | None = "Gen4 x16",
+        pcie_max: str | None = "Gen4 x16",
     ) -> None:
         self.db.execute(
-            "INSERT INTO gpu(host, pci_addr, vendor_id, device_id, pci_class, model, description) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (host, pci, vendor_id, device_id, pci_class, model, description),
+            "INSERT INTO gpu(host, pci_addr, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (host, pci, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max),
         )
         self.db.commit()
 
@@ -298,19 +304,28 @@ opasmaquery: failed to open port: Device or resource busy
         self.db_path.unlink()
         old = sqlite3.connect(self.db_path)
         old.execute("CREATE TABLE host (name TEXT PRIMARY KEY, probed_at TEXT, reachable INTEGER, error TEXT, fqdn TEXT)")
+        old.execute("CREATE TABLE gpu (host TEXT, pci_addr TEXT, vendor_id TEXT, device_id TEXT, pci_class TEXT, model TEXT, description TEXT, PRIMARY KEY (host, pci_addr))")
         old.commit()
         old.close()
         self.db = bi.open_db(self.db_path)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(host)")}
         self.assertTrue({"source", "model", "cpu", "sockets", "cores", "os", "kernel"}.issubset(columns))
+        gpu_columns = {row[1] for row in self.db.execute("PRAGMA table_info(gpu)")}
+        self.assertTrue({"pcie_gen", "pcie_width", "pcie_cur", "pcie_max"}.issubset(gpu_columns))
         bi.store_probe(self.db, {"host": "cn-host01", "out": PROBE_OUTPUT})
         self.db.commit()
         row = self.db.execute("SELECT reachable, model, cpu, os FROM host WHERE name='cn-host01'").fetchone()
         self.assertEqual(tuple(row), (1, "Cornelis Networks CN6000 Test Platform", "Intel(R) Xeon(R) Gold 6430", "Rocky Linux 9.4"))
         ports = self.db.execute("SELECT kind, ifname FROM port WHERE host='cn-host01' ORDER BY kind").fetchall()
         self.assertEqual([tuple(port) for port in ports], [("eth", "ens1"), ("opa", "hfi1_0")])
-        gpus = self.db.execute("SELECT pci_addr, vendor_id, model FROM gpu WHERE host='cn-host01' ORDER BY pci_addr").fetchall()
-        self.assertEqual([tuple(gpu) for gpu in gpus], [("0000:0b:00.0", "10de", "NVIDIA L40S"), ("0001:0b:00.0", "10de", "NVIDIA L40S")])
+        gpus = self.db.execute("SELECT pci_addr, vendor_id, model, pcie_gen, pcie_width, pcie_cur, pcie_max FROM gpu WHERE host='cn-host01' ORDER BY pci_addr").fetchall()
+        self.assertEqual(
+            [tuple(gpu) for gpu in gpus],
+            [
+                ("0000:0b:00.0", "10de", "NVIDIA L40S", "Gen4", "x16", "Gen1 x16", "Gen4 x16"),
+                ("0001:0b:00.0", "10de", "NVIDIA L40S", "Gen4", "x16", "Gen4 x16", "Gen4 x16"),
+            ],
+        )
 
     def test_host_gen_classifies_single_mixed_and_unprobed_hosts(self) -> None:
         self.add_host("fivek01")
@@ -1214,12 +1229,16 @@ opasmaquery: failed to open port: Device or resource busy
             "0000:dd:00.0 Processing accelerators [1200]: Advanced Micro Devices, Inc. [AMD/ATI] Aqua Vanjaram [Instinct MI300X] [1002:74a1]\n"
             "0000:00:02.0 VGA compatible controller [0300]: Intel Corporation UHD Graphics 770 [8086:4680]\n"
             "0000:6a:00.0 Processing accelerators [1200]: Intel Corporation Device [8086:2710]\n"
+            "PCIE|0000:dd:00.0|8.0 GT/s PCIe|8|32.0 GT/s PCIe|16|8.0 GT/s PCIe|8\n"
             "@@DONE\n"
         )
         self.assertEqual([gpu["model"] for gpu in parsed["gpus"]], ["AMD Instinct MI300X"])
+        self.assertEqual((parsed["gpus"][0]["pcie_gen"], parsed["gpus"][0]["pcie_width"], parsed["gpus"][0]["pcie_max"]), ("Gen3", "x8", "Gen5 x16"))
         self.add_host("dual01")
         self.add_gpu("dual01", "0000:0b:00.0", model="NVIDIA L40S")
         self.add_gpu("dual01", "0001:0b:00.0", model="NVIDIA L40S")
+        self.add_host("legacy-gpu01")
+        self.add_gpu("legacy-gpu01", "0000:0c:00.0", model="NVIDIA A100", pcie_gen=None, pcie_width=None, pcie_cur=None, pcie_max=None)
         self.add_host("booked-gpu01", reachable=0)
         self.add_resource(1, "GPU-DEV-02", ["booked-gpu01"])
         self.db.execute("UPDATE resource SET attrs_json=? WHERE id=1", (json.dumps({"GPU": "Nvidia A40"}),))
@@ -1228,16 +1247,20 @@ opasmaquery: failed to open port: Device or resource busy
         self.db.execute("UPDATE resource SET attrs_json=? WHERE id=2", (json.dumps({"GPU": "None"}),))
         self.add_host("nogpu01")
         self.db.commit()
-        self.assertEqual(bi.host_gpu(self.db, "dual01"), "2x NVIDIA L40S")
+        self.assertEqual(bi.host_gpu(self.db, "dual01"), "2x NVIDIA L40S (Gen4 x16)")
+        self.assertEqual(bi.host_gpu(self.db, "legacy-gpu01"), "NVIDIA A100")
         self.assertEqual(bi.host_gpu(self.db, "booked-gpu01"), "Nvidia A40")
         self.assertEqual(bi.host_gpu(self.db, "placeholder01"), "-")
         self.assertEqual(bi.host_gpu(self.db, "nogpu01"), "-")
+        short_gpu = bi._short("AMD Radeon RX 9070/9070 XT/9070 GRE (Gen5 x16)", 38)
+        self.assertEqual(len(short_gpu), 38)
+        self.assertTrue(short_gpu.endswith("(Gen5 x16)"))
 
     def test_list_show_and_status_report_and_filter_gpus(self) -> None:
         self.add_host("gpu-nv01")
         self.add_adapter("gpu-nv01", "0000:01:00.0", "CN6000")
-        self.add_gpu("gpu-nv01", "0000:0b:00.0", model="NVIDIA L40S")
-        self.add_gpu("gpu-nv01", "0001:0b:00.0", model="NVIDIA L40S")
+        self.add_gpu("gpu-nv01", "0000:0b:00.0", model="NVIDIA L40S", pcie_cur="Gen1 x16", pcie_max="Gen4 x16")
+        self.add_gpu("gpu-nv01", "0001:0b:00.0", model="NVIDIA L40S", pcie_cur="Gen4 x16", pcie_max="Gen4 x16")
         self.add_resource(1, "gpu_b2b_01", ["gpu-nv01"])
         self.add_host("gpu-amd01")
         self.add_gpu(
@@ -1250,21 +1273,26 @@ opasmaquery: failed to open port: Device or resource busy
             description="Advanced Micro Devices, Inc. [AMD/ATI] Arcturus GL-XL [Instinct MI100]",
         )
         self.add_host("cpu-only01")
+        self.add_host("booked-only01", reachable=0)
+        self.add_resource(2, "GPU-DEV-02", ["booked-only01"])
+        self.db.execute("UPDATE resource SET attrs_json=? WHERE id=2", (json.dumps({"GPU": "Nvidia A40"}),))
+        self.db.commit()
 
         code, text, _ = self.run_cli("list", "--offline", "--gpu")
         self.assertEqual(code, 0)
         self.assertIn("GPU", text.splitlines()[0])
         self.assertIn("gpu-nv01", text)
-        self.assertIn("2x NVIDIA L40S", text)
+        self.assertIn("2x NVIDIA L40S (Gen4 x16)", text)
         self.assertIn("gpu-amd01", text)
-        self.assertIn("AMD Instinct MI100", text)
+        self.assertIn("AMD Instinct MI100 (Gen4 x16)", text)
+        self.assertIn("Nvidia A40 (Booked)", text)
         self.assertNotIn("cpu-only01", text)
 
         code, text, _ = self.run_cli("list", "--offline", "--gpu", "10de:26b9", "--json")
         self.assertEqual(code, 0)
         payload = json.loads(text)
         self.assertEqual([h["host"] for h in payload["hosts"]], ["gpu-nv01"])
-        self.assertEqual(payload["hosts"][0]["gpu"], "2x NVIDIA L40S")
+        self.assertEqual(payload["hosts"][0]["gpu"], "2x NVIDIA L40S (Gen4 x16)")
         self.assertEqual(payload["hosts"][0]["gpu_count"], 2)
         self.assertEqual(payload["hosts"][0]["gpu_source"], "pcie")
         self.assertEqual(payload["summary"]["gpu"], 1)
@@ -1276,13 +1304,14 @@ opasmaquery: failed to open port: Device or resource busy
 
         code, text, _ = self.run_cli("show", "gpu-nv01", "--offline")
         self.assertEqual(code, 0)
-        self.assertIn("GPU: 2x NVIDIA L40S", text)
+        self.assertIn("GPU: 2x NVIDIA L40S (Gen4 x16)", text)
         self.assertIn("GPUs:", text)
-        self.assertIn("0000:0b:00.0  NVIDIA L40S  [10de:26b9]", text)
+        self.assertIn("0000:0b:00.0  NVIDIA L40S  [10de:26b9]  PCIe Gen4 x16 (cur Gen1 x16)", text)
+        self.assertIn("0001:0b:00.0  NVIDIA L40S  [10de:26b9]  PCIe Gen4 x16  3D controller", text)
 
         code, text, _ = self.run_cli("show", "gpu_b2b_01", "--offline")
         self.assertEqual(code, 0)
-        self.assertIn("gpu=2x NVIDIA L40S", text)
+        self.assertIn("gpu=2x NVIDIA L40S (Gen4 x16)", text)
 
         code, text, _ = self.run_cli("status")
         self.assertEqual(code, 0)
