@@ -38,8 +38,12 @@ SYS|kernel|5.14.0-test
 0000:41:00.0 Network controller [0280]: Cornelis Networks Inc CN5000 [434e:0001]
 0000:81:00.0 Network controller [0280]: Cornelis Networks Inc CN6000 [434e:0002]
 0001:0b:00.0 3D controller [0302]: NVIDIA Corporation AD102GL [L40S] [10de:26b9] (rev a1)
-PCIE|0000:0b:00.0|2.5 GT/s PCIe|16|16.0 GT/s PCIe|16
-PCIE|0001:0b:00.0|16.0 GT/s PCIe|16|16.0 GT/s PCIe|16
+PCIE|0000:0b:00.0|2.5 GT/s PCIe|16|16.0 GT/s PCIe|16|32.0 GT/s PCIe|16
+PCIE|0001:0b:00.0|16.0 GT/s PCIe|16|16.0 GT/s PCIe|16|32.0 GT/s PCIe|16
+SLOT|0000:0a:02.0|32.0 GT/s PCIe|16|2.5 GT/s PCIe|16
+SLOT|0000:5b:02.0|32.0 GT/s PCIe|16|32.0 GT/s PCIe|16
+SLOT|0000:83:06.0|32.0 GT/s PCIe|8|8.0 GT/s PCIe|4
+SLOT|0001:0a:02.0|32.0 GT/s PCIe|16|16.0 GT/s PCIe|16
 @@IB
 PORT|hfi1_0|1|0000:41:00.0|00:11:22:33:44:55:66:77|4: ACTIVE|5: LinkUp|17
 @@SMA|hfi1_0|1
@@ -133,6 +137,23 @@ class InventoryTestCase(unittest.TestCase):
             "INSERT INTO gpu(host, pci_addr, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (host, pci, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max),
+        )
+        self.db.commit()
+
+    def add_slot(
+        self,
+        host: str,
+        pci: str = "0000:0a:02.0",
+        *,
+        pcie_gen: str = "Gen5",
+        pcie_width: str = "x16",
+        pcie_cur: str | None = "Gen5 x16",
+        pcie_max: str | None = "Gen5 x16",
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO slot(host, pci_addr, pcie_gen, pcie_width, pcie_cur, pcie_max) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (host, pci, pcie_gen, pcie_width, pcie_cur, pcie_max),
         )
         self.db.commit()
 
@@ -1316,6 +1337,54 @@ opasmaquery: failed to open port: Device or resource busy
         code, text, _ = self.run_cli("status")
         self.assertEqual(code, 0)
         self.assertIn("GPUs:    2 probed host(s) (3 PCIe device(s))", text)
+
+    def test_pcie_slots_summary_filtering_and_show(self) -> None:
+        bi.store_probe(self.db, {"host": "cn-host01", "out": PROBE_OUTPUT})
+        self.add_host("single-gen5")
+        self.add_slot("single-gen5", "0000:e0:01.1", pcie_gen="Gen5", pcie_width="x16")
+        self.add_slot("single-gen5", "0000:a0:01.1", pcie_gen="Gen4", pcie_width="x16")
+        self.add_host("venice01")
+        self.add_slot("venice01", "0000:10:03.1", pcie_gen="Gen6", pcie_width="x16")
+        self.add_slot("venice01", "0000:30:03.1", pcie_gen="Gen6", pcie_width="x16")
+        self.add_host("noslots01")
+        self.db.commit()
+
+        self.assertEqual(bi.host_slots(self.db, "cn-host01"), "3x Gen5 x16 + Gen5 x8")
+        self.assertEqual(bi.host_slots(self.db, "single-gen5"), "Gen5 x16 + Gen4 x16")
+        self.assertEqual(bi.host_slots(self.db, "venice01"), "2x Gen6 x16")
+
+        code, text, _ = self.run_cli("list", "--offline", "--pcie", "2x gen5")
+        self.assertEqual(code, 0)
+        self.assertIn("SLOTS", text.splitlines()[0])
+        self.assertIn("cn-host01", text)
+        self.assertIn("3x Gen5 x16 + Gen5 x8", text)
+        self.assertNotIn("single-gen5", text)
+        self.assertNotIn("venice01", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "--pcie", "gen1")
+        self.assertEqual(code, 0)
+        self.assertNotIn("cn-host01", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "--pcie", ">2 gen5")
+        self.assertEqual(code, 0)
+        self.assertIn("cn-host01", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "--pcie", "none")
+        self.assertEqual(code, 0)
+        self.assertIn("noslots01", text)
+        self.assertNotIn("cn-host01", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "--slots", "2x gen6", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(text)
+        self.assertEqual([h["host"] for h in payload["hosts"]], ["venice01"])
+        self.assertEqual(payload["hosts"][0]["pcie_slots"], "2x Gen6 x16")
+
+        code, text, _ = self.run_cli("show", "cn-host01", "--offline")
+        self.assertEqual(code, 0)
+        self.assertIn("PCIe slots: 3x Gen5 x16 + Gen5 x8", text)
+        self.assertIn("Slots:", text)
+        self.assertIn("0000:0a:02.0  PCIe Gen5 x16 (cur Gen1 x16)", text)
 
 
 if __name__ == "__main__":
