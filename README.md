@@ -64,6 +64,7 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 ./cnhwinv list --gpu                        # hosts with PCIe-probed or Booked GPU metadata
 ./cnhwinv list --gpu nvidia --available     # filter by GPU model/vendor/PCI ID substring
 ./cnhwinv list --pcie '2x gen5'             # hosts with at least 2 PCIe Gen5 slots
+./cnhwinv list --cpu arm                    # filter by CPU model or architecture (arm/x86)
 ./cnhwinv list --source discovered --json
 ./cnhwinv list --available                  # every mapped Booked resource is free
 ./cnhwinv list --link down --gen 5k          # cached Cornelis HSN links with no ports up

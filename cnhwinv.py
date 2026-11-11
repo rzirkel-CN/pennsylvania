@@ -58,6 +58,116 @@ PCIE_GEN_BY_GTS = {
 }
 _IGPU_RE = re.compile(r"\b(UHD|HD|Integrated)\s+Graphics\b", re.IGNORECASE)
 _NO_GPU_VALUES = {"-", "none", "n/a", "na", "no", "false", "0", "tbd"}
+_CPU_PLACEHOLDERS = _NO_GPU_VALUES | {"unknown", "not specified", "to be filled by o.e.m.", "default string"}
+_GENERIC_ARM_CPU_RE = re.compile(r"^(?:ARMv\d+\w*|AArch64)\s+Processor\b", re.IGNORECASE)
+_GENERIC_BIOS_CPU_RE = re.compile(r"^(?:ARMv\d[^,]*|AArch64\s+Processor.*|virt-\d.*)$", re.IGNORECASE)
+# ARM MIDR_EL1 implementer and part numbers for kernels or older lscpu builds
+# that omit `model name` in /proc/cpuinfo on aarch64.
+ARM_IMPLEMENTERS = {
+    0x41: "ARM",
+    0x42: "Broadcom",
+    0x43: "Cavium",
+    0x44: "DEC",
+    0x46: "Fujitsu",
+    0x48: "HiSilicon",
+    0x49: "Infineon",
+    0x4D: "Motorola",
+    0x4E: "NVIDIA",
+    0x50: "APM",
+    0x51: "Qualcomm",
+    0x53: "Samsung",
+    0x56: "Marvell",
+    0x61: "Apple",
+    0x66: "Faraday",
+    0x68: "Huaxintong",
+    0x69: "Intel",
+    0x6D: "Microsoft",
+    0x70: "Phytium",
+    0xC0: "Ampere",
+}
+ARM_PARTS = {
+    (0x41, 0xD03): "Cortex-A53",
+    (0x41, 0xD04): "Cortex-A35",
+    (0x41, 0xD05): "Cortex-A55",
+    (0x41, 0xD06): "Cortex-A65",
+    (0x41, 0xD07): "Cortex-A57",
+    (0x41, 0xD08): "Cortex-A72",
+    (0x41, 0xD09): "Cortex-A73",
+    (0x41, 0xD0A): "Cortex-A75",
+    (0x41, 0xD0B): "Cortex-A76",
+    (0x41, 0xD0C): "Neoverse-N1",
+    (0x41, 0xD0D): "Cortex-A77",
+    (0x41, 0xD0E): "Cortex-A76AE",
+    (0x41, 0xD40): "Neoverse-V1",
+    (0x41, 0xD41): "Cortex-A78",
+    (0x41, 0xD42): "Cortex-A78AE",
+    (0x41, 0xD43): "Cortex-A65AE",
+    (0x41, 0xD44): "Cortex-X1",
+    (0x41, 0xD46): "Cortex-A510",
+    (0x41, 0xD47): "Cortex-A710",
+    (0x41, 0xD48): "Cortex-X2",
+    (0x41, 0xD49): "Neoverse-N2",
+    (0x41, 0xD4A): "Neoverse-E1",
+    (0x41, 0xD4B): "Cortex-A78C",
+    (0x41, 0xD4C): "Cortex-X1C",
+    (0x41, 0xD4D): "Cortex-A715",
+    (0x41, 0xD4E): "Cortex-X3",
+    (0x41, 0xD4F): "Neoverse-V2",
+    (0x41, 0xD80): "Cortex-A520",
+    (0x41, 0xD81): "Cortex-A720",
+    (0x41, 0xD82): "Cortex-X4",
+    (0x41, 0xD83): "Neoverse-V3AE",
+    (0x41, 0xD84): "Neoverse-V3",
+    (0x41, 0xD85): "Cortex-X925",
+    (0x41, 0xD87): "Cortex-A725",
+    (0x41, 0xD8E): "Neoverse-N3",
+    (0x43, 0x0A0): "ThunderX",
+    (0x43, 0x0A1): "ThunderX 88XX",
+    (0x43, 0x0A2): "ThunderX 81XX",
+    (0x43, 0x0A3): "ThunderX 83XX",
+    (0x43, 0x0AF): "ThunderX2 99xx",
+    (0x43, 0x0B8): "ThunderX3",
+    (0x46, 0x001): "A64FX",
+    (0x46, 0x003): "MONAKA",
+    (0x48, 0xD01): "Kunpeng-920",
+    (0x48, 0xD02): "Kunpeng-930",
+    (0x4E, 0x003): "Denver",
+    (0x4E, 0x004): "Carmel",
+    (0x4E, 0x010): "Olympus",
+    (0x50, 0x000): "X-Gene",
+    (0x51, 0x001): "Oryon",
+    (0x51, 0xC00): "Falkor",
+    (0x51, 0xC01): "Saphira",
+    (0x61, 0x022): "M1 Icestorm",
+    (0x61, 0x023): "M1 Firestorm",
+    (0x61, 0x024): "M1 Pro/Max Icestorm",
+    (0x61, 0x025): "M1 Pro/Max Firestorm",
+    (0x61, 0x028): "M1 Ultra Icestorm",
+    (0x61, 0x029): "M1 Ultra Firestorm",
+    (0x61, 0x032): "M2 Blizzard",
+    (0x61, 0x033): "M2 Avalanche",
+    (0x6D, 0xD49): "Cobalt 100",
+    (0x70, 0x303): "FTC310",
+    (0x70, 0x660): "FTC660",
+    (0x70, 0x661): "FTC661",
+    (0x70, 0x662): "FTC662",
+    (0x70, 0x663): "FTC663",
+    (0x70, 0x862): "FTC862",
+    (0xC0, 0xAC3): "Ampere-1",
+    (0xC0, 0xAC4): "Ampere-1a",
+}
+_ARM_CPU_RE = re.compile(
+    r"\b(arm|arm64|aarch64|armv[789]\w*|neoverse|cortex-[axrm]\d+\w*|ampere(?:one|-1\w*)?|altra|"
+    r"grace|a64fx|monaka|thunderx\d*|kunpeng|taishan|oryon|falkor|saphira|x-gene|phytium|ftc\d+|"
+    r"carmel|denver|olympus|cobalt\s+100|apple\s+m\d)\b",
+    re.IGNORECASE,
+)
+_ARM_KERNEL_RE = re.compile(r"(?:^|[._-])(aarch64|arm64|armv[789]\w*)(?:$|[._-])", re.IGNORECASE)
+_X86_CPU_RE = re.compile(
+    r"\b(intel|xeon|amd|epyc|ryzen|threadripper|core|atom|pentium|celeron|hygon|zhaoxin)\b",
+    re.IGNORECASE,
+)
+_X86_KERNEL_RE = re.compile(r"(?:^|[._-])(x86_64|amd64|i[3456]86)(?:$|[._-])", re.IGNORECASE)
 _DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
 DEFAULT_DB = _DATA_HOME / "cnhwinv/inventory.db"
 # Cache location used before the tool was renamed from booked_inventory.
@@ -442,13 +552,22 @@ for d in /sys/class/infiniband/*; do [ -d "$d" ] || continue
     sma_fds+=("$fd")
   done
 done
+lscpu_out=$(lscpu 2>/dev/null)
 echo "@@FQDN $(hostname -f 2>/dev/null || hostname)"
 echo "@@SYS"
 echo "SYS|vendor|$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)"
-echo "SYS|model|$(cat /sys/class/dmi/id/product_name 2>/dev/null)"
+echo "SYS|model|$(cat /sys/class/dmi/id/product_name 2>/dev/null || tr -d '\0' </sys/firmware/devicetree/base/model 2>/dev/null)"
 echo "SYS|version|$(cat /sys/class/dmi/id/product_version 2>/dev/null)"
+echo "SYS|arch|$(uname -m 2>/dev/null)"
 echo "SYS|cpu|$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2-)"
-echo "SYS|sockets|$(grep '^physical id' /proc/cpuinfo 2>/dev/null | sort -u | wc -l)"
+echo "SYS|cpu_proc|$(grep -m1 '^Processor' /proc/cpuinfo 2>/dev/null | cut -d: -f2-)"
+echo "SYS|cpu_impl|$(grep -m1 '^CPU implementer' /proc/cpuinfo 2>/dev/null | cut -d: -f2-)"
+echo "SYS|cpu_part|$(grep -m1 '^CPU part' /proc/cpuinfo 2>/dev/null | cut -d: -f2-)"
+echo "SYS|lscpu_vendor|$(grep -m1 '^Vendor ID:' <<< "$lscpu_out" | cut -d: -f2-)"
+echo "SYS|lscpu_model|$(grep -m1 '^Model name:' <<< "$lscpu_out" | cut -d: -f2-)"
+echo "SYS|lscpu_bios|$(grep -m1 '^BIOS Model name:' <<< "$lscpu_out" | cut -d: -f2-)"
+echo "SYS|lscpu_sockets|$(grep -m1 '^Socket(s):' <<< "$lscpu_out" | cut -d: -f2-)"
+echo "SYS|sockets|$(s=$(grep '^physical id' /proc/cpuinfo 2>/dev/null | sort -u | wc -l); [ "${s:-0}" -gt 0 ] || s=$(grep -m1 '^Socket(s):' <<< "$lscpu_out" | tr -dc '0-9'); [ "${s:-0}" -gt 0 ] || s=$(cat /sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id 2>/dev/null | grep -vx -- -1 | sort -u | wc -l); echo "${s:-0}")"
 echo "SYS|cores|$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)"
 echo "SYS|os|$(. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME")"
 echo "SYS|kernel|$(uname -r)"
@@ -639,6 +758,91 @@ def _gpu_model(vendor_id: str, device_id: str, description: str) -> str:
     return f"{vendor} {label}"
 
 
+def _parse_hex_int(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value.strip(), 0)
+    except ValueError:
+        return None
+
+
+def _clean_cpu_label(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = re.sub(
+        r"\b(?:Not Specified|To Be Filled By O\.E\.M\.|Default string)\b",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    cleaned = " ".join(cleaned.split()).strip(" -_,;/")
+    if not cleaned or cleaned.lower() in _CPU_PLACEHOLDERS:
+        return None
+    return cleaned
+
+
+def _cpu_model(system: dict) -> str | None:
+    """Resolve a human-readable CPU model across x86 and ARM probe facts."""
+    cpu = _clean_cpu_label(system.get("cpu"))
+    if cpu and not _GENERIC_ARM_CPU_RE.match(cpu):
+        return cpu
+
+    impl = _parse_hex_int(system.get("cpu_impl"))
+    part = _parse_hex_int(system.get("cpu_part"))
+    lscpu_vendor = _clean_cpu_label(system.get("lscpu_vendor"))
+    vendor = ARM_IMPLEMENTERS.get(impl) if impl is not None else None
+    if not vendor and lscpu_vendor:
+        vendor = {"genuineintel": "Intel", "authenticamd": "AMD"}.get(lscpu_vendor.lower(), lscpu_vendor)
+
+    lscpu_model = _clean_cpu_label(system.get("lscpu_model"))
+    if lscpu_model and _GENERIC_ARM_CPU_RE.match(lscpu_model):
+        lscpu_model = None
+    core_name = (ARM_PARTS.get((impl, part)) if impl is not None and part is not None else None) or lscpu_model
+
+    core_label: str | None = None
+    if core_name:
+        core_label = f"{vendor} {core_name}" if vendor and vendor.lower() not in core_name.lower() else core_name
+    elif impl is not None and part is not None:
+        core_label = f"{vendor or 'ARM'} [0x{impl:02x}:0x{part:03x}]"
+
+    bios_label = _clean_cpu_label(system.get("lscpu_bios"))
+    if bios_label and _GENERIC_BIOS_CPU_RE.match(bios_label):
+        bios_label = None
+
+    if bios_label and core_label:
+        if (core_name and core_name.lower() in bios_label.lower()) or core_label.lower() in bios_label.lower():
+            return bios_label
+        return f"{bios_label} ({core_label})"
+    if core_label:
+        return core_label
+    if bios_label:
+        return bios_label
+    if cpu:
+        return cpu
+    proc = _clean_cpu_label(system.get("cpu_proc"))
+    if proc and not proc.isdigit():
+        return proc
+    arch = (system.get("arch") or "").strip().lower()
+    if arch in ("aarch64", "arm64"):
+        return "ARM64"
+    if arch.startswith("arm"):
+        return "ARM"
+    return None
+
+
+def _cpu_sockets(system: dict) -> str | None:
+    """Resolve physical socket count across x86 /proc/cpuinfo and ARM lscpu/sysfs."""
+    for key in ("sockets", "lscpu_sockets"):
+        raw = (system.get(key) or "").strip()
+        if raw.isdigit() and int(raw) > 0:
+            return str(int(raw))
+    cores = (system.get("cores") or "").strip()
+    if cores.isdigit() and int(cores) > 0:
+        return "1"
+    return None
+
+
 def parse_probe(output: str) -> dict:
     """Parse stable section markers emitted by REMOTE_SCRIPT into cached facts."""
     result: dict = {"fqdn": None, "adapters": [], "gpus": [], "slots": [], "ports": [], "net": [], "lldp": None, "sys": {}}
@@ -773,6 +977,11 @@ def parse_probe(output: str) -> dict:
             result["lldp"] = json.loads("\n".join(lldp_lines))
         except json.JSONDecodeError:
             result["lldp"] = None
+    if result["sys"]:
+        result["sys"]["cpu"] = _cpu_model(result["sys"])
+        result["sys"]["sockets"] = _cpu_sockets(result["sys"])
+        if result["sys"].get("cores") == "0":
+            result["sys"]["cores"] = None
     return result
 
 
@@ -899,7 +1108,7 @@ def _stale_hosts(db: sqlite3.Connection, args: argparse.Namespace) -> list[str]:
         row[0]
         for row in db.execute(
             "SELECT name FROM host WHERE probed_at IS NULL OR probed_at < datetime('now', ?) "
-            "OR (reachable=1 AND cpu IS NULL AND os IS NULL) ORDER BY name",
+            "OR (reachable=1 AND ((cpu IS NULL AND os IS NULL) OR sockets='0')) ORDER BY name",
             (f"-{args.max_age} hours",),
         )
     ]
@@ -1607,6 +1816,28 @@ def _matches_slots(filter_value: str | None, slot_summary: str, slots: list[dict
     return needle in " ".join(parts).lower()
 
 
+def _is_arm_cpu(cpu: str | None, kernel: str | None = None) -> bool:
+    return bool((cpu and _ARM_CPU_RE.search(cpu)) or (kernel and _ARM_KERNEL_RE.search(kernel)))
+
+
+def _matches_cpu(filter_value: str | None, cpu: str | None, kernel: str | None = None) -> bool:
+    if not filter_value:
+        return True
+    needle = filter_value.strip().lower()
+    if not needle:
+        return True
+    if needle in (cpu or "").lower():
+        return True
+    if needle in ("arm", "arm64", "aarch64"):
+        return _is_arm_cpu(cpu, kernel)
+    if needle in ("x86", "x86_64", "amd64"):
+        return bool(
+            not _is_arm_cpu(cpu, kernel)
+            and ((cpu and _X86_CPU_RE.search(cpu)) or (kernel and _X86_KERNEL_RE.search(kernel)))
+        )
+    return False
+
+
 def _short(value: str | None, length: int) -> str:
     """Fit verbose DMI strings into a readable fixed-width table cell."""
     cleaned = (value or "-").replace("(R)", "").replace("(TM)", "").replace(" CPU", "").replace(" Processor", "")
@@ -1614,7 +1845,7 @@ def _short(value: str | None, length: int) -> str:
     cleaned = " ".join(cleaned.split())
     if len(cleaned) <= length:
         return cleaned
-    if match := re.search(r"(\s+\((?:Gen\d[^)]*|Booked)\))$", cleaned):
+    if match := re.search(r"(\s+\((?:Gen\d[^)]*|Booked|ARM[^)]*)\))$", cleaned):
         suffix = match.group(1)
         head_len = length - len(suffix)
         if head_len > 2:
@@ -1700,13 +1931,15 @@ def _normalise_generation(value: str, allow_controls: bool = True) -> str:
 def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[list[dict], dict]:
     """Apply reporting filters once and return both rows and a useful summary."""
     rows = db.execute(
-        "SELECT h.name, h.reachable, h.probed_at, h.source, h.model, h.cpu, h.os, r.name, "
+        "SELECT h.name, h.reachable, h.probed_at, h.source, h.model, h.cpu, h.os, h.kernel, r.name, "
         "r.avail_state, r.avail_until, r.avail_at, r.reserved_by "
         "FROM host h LEFT JOIN resource_host rh ON rh.host=h.name "
         "LEFT JOIN resource r ON r.id=rh.resource_id ORDER BY h.name, r.name"
     ).fetchall()
     hosts: dict[str, dict] = {}
-    for name, reachable, probed_at, source, model, cpu, os_name, resource_name, avail_state, avail_until, avail_at, reserved_by in rows:
+    kernels: dict[str, str | None] = {}
+    for name, reachable, probed_at, source, model, cpu, os_name, kernel, resource_name, avail_state, avail_until, avail_at, reserved_by in rows:
+        kernels[name] = kernel
         entry = hosts.setdefault(
             name,
             {
@@ -1742,10 +1975,12 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
         gpu_source = "pcie" if gpus else ("booked" if gpu != "-" else None)
         slots = _host_slots(db, name)
         slot_summary = host_slots(db, name, slots)
-        platform = ((args.model, entry["model"]), (args.cpu, entry["cpu"]), (args.os, entry["os"]))
+        platform = ((args.model, entry["model"]), (args.os, entry["os"]))
         booked_status, booked_until, booked_by = _booked_summary(entry["resources"])
         hsn_link, hsn_ports_up, hsn_ports_total = _hsn_link(db, name, probed_at, reachable)
         if any(filter_value and filter_value.lower() not in (actual or "").lower() for filter_value, actual in platform):
+            continue
+        if not _matches_cpu(args.cpu, entry["cpu"], kernels.get(name)):
             continue
         if not _matches_gpu(getattr(args, "gpu", None), gpu, gpus):
             continue
@@ -2571,7 +2806,7 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--reachable", action="store_true", help="only latest probes that were reachable")
     listing.add_argument("--wide", "-w", action="store_true", help="also show server model, CPU, GPU, PCIe slots, and OS")
     listing.add_argument("--model", help="filter server model substring (case-insensitive)")
-    listing.add_argument("--cpu", help="filter CPU model substring (case-insensitive)")
+    listing.add_argument("--cpu", help="filter CPU model or architecture, e.g. epyc, xeon, arm, neoverse (case-insensitive)")
     listing.add_argument("--gpu", nargs="?", const="*", metavar="GPU", help="only hosts with a GPU, or filter GPU model/vendor substring (or 'none')")
     listing.add_argument("--pcie", "--slots", dest="pcie", nargs="?", const="*", metavar="SLOTS", help="filter PCIe slots, e.g. gen5, '2x gen5', '4x gen5 x16', gen6 (or 'none')")
     listing.add_argument("--os", help="filter OS substring (case-insensitive)")

@@ -1386,6 +1386,131 @@ opasmaquery: failed to open port: Device or resource busy
         self.assertIn("Slots:", text)
         self.assertIn("0000:0a:02.0  PCIe Gen5 x16 (cur Gen1 x16)", text)
 
+    def test_arm_cpu_probe_parsing_midr_lscpu_bios_and_sockets(self) -> None:
+        grace_probe = """@@FQDN arm-grace01.example.com
+@@SYS
+SYS|vendor|NVIDIA
+SYS|model|Grace CPU Superchip
+SYS|arch|aarch64
+SYS|cpu|
+SYS|cpu_proc|
+SYS|cpu_impl|0x41
+SYS|cpu_part|0xd4f
+SYS|lscpu_vendor|ARM
+SYS|lscpu_model|-
+SYS|lscpu_bios|NVIDIA Grace
+SYS|lscpu_sockets|2
+SYS|sockets|0
+SYS|cores|144
+SYS|os|Rocky Linux 9.4 (Blue Onyx)
+SYS|kernel|5.14.0-427.el9.aarch64
+@@DONE
+"""
+        parsed = bi.parse_probe(grace_probe)
+        self.assertEqual(parsed["sys"]["cpu"], "NVIDIA Grace (ARM Neoverse-V2)")
+        self.assertEqual(parsed["sys"]["sockets"], "2")
+        self.assertEqual(parsed["sys"]["cores"], "144")
+
+        # When lscpu is unavailable or returns "-" for Model name, MIDR resolves the core.
+        midr_only = bi.parse_probe(
+            "@@SYS\nSYS|arch|aarch64\nSYS|cpu|\nSYS|cpu_impl|0x41\nSYS|cpu_part|0xd4f\n"
+            "SYS|lscpu_vendor|\nSYS|lscpu_model|\nSYS|sockets|0\nSYS|cores|72\n@@DONE\n"
+        )
+        self.assertEqual(midr_only["sys"]["cpu"], "ARM Neoverse-V2")
+        self.assertEqual(midr_only["sys"]["sockets"], "1")
+
+        # Generic /proc/cpuinfo ARM placeholder is replaced when MIDR or lscpu knows the core.
+        generic_upgraded = bi.parse_probe(
+            "@@SYS\nSYS|arch|aarch64\nSYS|cpu|ARMv8 Processor rev 0 (v8l)\n"
+            "SYS|cpu_impl|0x41\nSYS|cpu_part|0xd0c\n"
+            "SYS|lscpu_bios|Ampere(R) Altra(R) Processor Q80-30 CPU @ 3.0GHz Not Specified\n"
+            "SYS|sockets|0\nSYS|cores|80\n@@DONE\n"
+        )
+        self.assertEqual(
+            generic_upgraded["sys"]["cpu"],
+            "Ampere(R) Altra(R) Processor Q80-30 CPU @ 3.0GHz (ARM Neoverse-N1)",
+        )
+        self.assertEqual(generic_upgraded["sys"]["sockets"], "1")
+        short_cpu = bi._short(generic_upgraded["sys"]["cpu"], 44)
+        self.assertEqual(len(short_cpu), 44)
+        self.assertTrue(short_cpu.endswith("(ARM Neoverse-N1)"))
+
+        # Vendor-specific and unknown ARM MIDR part numbers format cleanly without duplicating vendor.
+        self.assertEqual(bi._cpu_model({"cpu_impl": "0xc0", "cpu_part": "0xac3"}), "Ampere-1")
+        self.assertEqual(bi._cpu_model({"cpu_impl": "0x46", "cpu_part": "0x001"}), "Fujitsu A64FX")
+        self.assertEqual(bi._cpu_model({"cpu_impl": "0x41", "cpu_part": "0xdff"}), "ARM [0x41:0xdff]")
+        self.assertEqual(
+            bi._cpu_model({"cpu_proc": "ARMv7 Processor rev 3 (v7l)", "arch": "armv7l"}),
+            "ARMv7 Processor rev 3 (v7l)",
+        )
+        self.assertEqual(bi._cpu_model({"arch": "aarch64"}), "ARM64")
+
+    def test_arm_cpu_list_filtering_show_and_stale_reprobe(self) -> None:
+        grace_probe = """@@FQDN arm-grace01.example.com
+@@SYS
+SYS|vendor|NVIDIA
+SYS|model|Grace Superchip
+SYS|arch|aarch64
+SYS|cpu|
+SYS|cpu_impl|0x41
+SYS|cpu_part|0xd4f
+SYS|lscpu_bios|NVIDIA Grace
+SYS|sockets|2
+SYS|cores|144
+SYS|os|Rocky Linux 9.4
+SYS|kernel|5.14.0-427.el9.aarch64
+@@DONE
+"""
+        bi.store_probe(self.db, {"host": "arm-grace01", "out": grace_probe})
+        self.add_host("arm-a64fx01", model="Fujitsu FX700", cpu="Fujitsu A64FX", os_name="Rocky Linux 9")
+        self.add_host("arm-ampere01", model="Mt. Jade", cpu="Ampere-1", os_name="Ubuntu 24.04")
+        self.add_host("x86-epyc01", model="Lenovo SR655", cpu="AMD EPYC 9654", os_name="Rocky Linux 9")
+        self.db.execute("INSERT INTO host(name, source) VALUES ('unprobed01', 'booked')")
+        self.db.commit()
+
+        for query in ("arm", "ARM64", "aarch64"):
+            code, text, _ = self.run_cli("list", "--offline", "--cpu", query, "--json")
+            self.assertEqual(code, 0)
+            hosts = [h["host"] for h in json.loads(text)["hosts"]]
+            self.assertEqual(hosts, ["arm-a64fx01", "arm-ampere01", "arm-grace01"])
+
+        code, text, _ = self.run_cli("list", "--offline", "--cpu", "neoverse", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual([h["host"] for h in json.loads(text)["hosts"]], ["arm-grace01"])
+
+        code, text, _ = self.run_cli("list", "--offline", "--cpu", "x86", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual([h["host"] for h in json.loads(text)["hosts"]], ["x86-epyc01"])
+
+        # Kernel architecture fallback when CPU model string is absent or custom.
+        self.assertTrue(bi._matches_cpu("arm", None, "5.14.0-427.el9.aarch64"))
+        self.assertTrue(bi._matches_cpu("x86", None, "5.14.0-427.el9.x86_64"))
+        self.assertFalse(bi._matches_cpu("arm", None, None))
+        self.assertTrue(bi._matches_cpu("", None, None))
+
+        code, text, _ = self.run_cli("show", "arm-grace01", "--offline")
+        self.assertEqual(code, 0)
+        self.assertIn("CPU: NVIDIA Grace (ARM Neoverse-V2)", text)
+        self.assertIn("Sockets: 2", text)
+        self.assertIn("Cores: 144", text)
+
+        # Reachable ARM hosts cached before ARM support had sockets='0';
+        # _stale_hosts must re-probe them once while leaving hosts with sockets!='0' fresh.
+        self.db.execute(
+            "INSERT INTO host(name, probed_at, reachable, cpu, sockets, cores, os) "
+            "VALUES ('legacy-arm01', datetime('now'), 1, NULL, '0', '80', 'Rocky Linux 9.4')"
+        )
+        self.db.execute(
+            "INSERT INTO host(name, probed_at, reachable, cpu, sockets, cores, os) "
+            "VALUES ('no-os-release01', datetime('now'), 1, 'ARM Neoverse-N1', '1', '80', NULL)"
+        )
+        self.db.commit()
+        stale = bi._stale_hosts(self.db, self.update_args())
+        self.assertIn("legacy-arm01", stale)
+        self.assertNotIn("no-os-release01", stale)
+        self.assertNotIn("arm-grace01", stale)
+        self.assertNotIn("x86-epyc01", stale)
+
 
 if __name__ == "__main__":
     unittest.main()
