@@ -39,6 +39,14 @@ BOOKED_API = "http://booked.cornelisnetworks.com/Web/Services/index.php"
 HOSTS_ATTR_ID = 2
 CN_VENDOR = "434e"
 GEN_BY_DEVICE = {"0001": "CN5000", "0002": "CN6000"}
+MLX_VENDOR = "15b3"
+# PCI network classes for Mellanox / NVIDIA Networking adapters: Ethernet (0200),
+# InfiniBand (0207), and Network controller (0280).
+MLX_CLASSES = {"0200", "0207", "0280"}
+_MLX_VF_RE = re.compile(r"\bVirtual\s+Function\b", re.IGNORECASE)
+_MLX_BOOKED_KEYS = {"mellanox", "mellanox nic", "mlx"}
+_MLX_CARD_KEYS = {"nic", "nics", "internal card", "card", "network card"}
+_MLX_ATTR_RE = re.compile(r"\b(mellanox|connectx|bluefield|cx-?[345678]|15b3)\b", re.IGNORECASE)
 # PCI display classes (VGA/3D/Display) and processing accelerators (1200, used by
 # AMD Instinct MI200/MI300); excludes onboard server BMC VGA (ASPEED 1a03, Matrox 102b).
 GPU_CLASSES = {"0300", "0302", "0380", "1200"}
@@ -195,6 +203,10 @@ CREATE TABLE IF NOT EXISTS gpu (
   host TEXT, pci_addr TEXT, vendor_id TEXT, device_id TEXT, pci_class TEXT,
   model TEXT, description TEXT, pcie_gen TEXT, pcie_width TEXT,
   pcie_cur TEXT, pcie_max TEXT, PRIMARY KEY (host, pci_addr));
+CREATE TABLE IF NOT EXISTS nic (
+  host TEXT, pci_addr TEXT, vendor_id TEXT, device_id TEXT, pci_class TEXT,
+  model TEXT, description TEXT, pcie_gen TEXT, pcie_width TEXT,
+  pcie_cur TEXT, pcie_max TEXT, PRIMARY KEY (host, pci_addr));
 CREATE TABLE IF NOT EXISTS slot (
   host TEXT, pci_addr TEXT, pcie_gen TEXT, pcie_width TEXT,
   pcie_cur TEXT, pcie_max TEXT, PRIMARY KEY (host, pci_addr));
@@ -218,6 +230,7 @@ TOP_EPILOG = """Common examples:
   cnhwinv update --max-age 24
   cnhwinv ls --gen 6k --reachable -w
   cnhwinv list --gpu
+  cnhwinv list --mlx
   cnhwinv list --available
   cnhwinv show cn123
   cnhwinv checkout cn123 --for 4h
@@ -516,13 +529,16 @@ export LC_ALL=C PATH=$PATH:/usr/sbin:/sbin
 # substitution, buffered in a variable so a timed-out or large output never
 # blocks on the pipe; results are read back below in the original fixed order.
 exec {lspci_fd}< <(
-  o=$(timeout 10 lspci -Dnn 2>/dev/null | grep -E '\[(434e:[0-9a-fA-F]{4}|0300|0302|0380|1200)\]')
+  o=$(timeout 10 lspci -Dnn 2>/dev/null | grep -E '\[(434e:[0-9a-fA-F]{4}|0300|0302|0380|1200)\]|\[(0200|0207|0280)\]:.*\[15b3:[0-9a-fA-F]{4}\]' | grep -vi 'Virtual Function')
   if [ -n "$o" ]; then
-    printf '%s\n' "$o"
-    while read -r pci _; do
-      d="/sys/bus/pci/devices/$pci"; r="$(readlink -f "$d" 2>/dev/null)"; sub="${r#/sys/devices/pci*/}"
+    while read -r pci rest; do
+      d="/sys/bus/pci/devices/$pci"
+      [ -e "$d/physfn" ] && continue
+      printf '%s %s\n' "$pci" "$rest"
+      [ -d "$d" ] || continue
+      r="$(readlink -f "$d" 2>/dev/null)"; sub="${r#/sys/devices/pci*/}"
       p="/sys/bus/pci/devices/${sub%%/*}"
-      [ -d "$d" ] && echo "PCIE|$pci|$(cat "$d/current_link_speed" 2>/dev/null)|$(cat "$d/current_link_width" 2>/dev/null)|$(cat "$d/max_link_speed" 2>/dev/null)|$(cat "$d/max_link_width" 2>/dev/null)|$(cat "$p/max_link_speed" 2>/dev/null)|$(cat "$p/max_link_width" 2>/dev/null)"
+      echo "PCIE|$pci|$(cat "$d/current_link_speed" 2>/dev/null)|$(cat "$d/current_link_width" 2>/dev/null)|$(cat "$d/max_link_speed" 2>/dev/null)|$(cat "$d/max_link_width" 2>/dev/null)|$(cat "$p/max_link_speed" 2>/dev/null)|$(cat "$p/max_link_width" 2>/dev/null)"
     done <<< "$o"
   fi
   # Enumerate x8+ root-port bridges (0x060400 directly under pciXXXX:XX),
@@ -758,6 +774,18 @@ def _gpu_model(vendor_id: str, device_id: str, description: str) -> str:
     return f"{vendor} {label}"
 
 
+def _mlx_model(device_id: str, description: str) -> str:
+    cleaned = description
+    for prefix in ("Mellanox Technologies", "NVIDIA Corporation"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :].strip()
+    brackets = [item.strip() for item in re.findall(r"\[([^\]]+)\]", cleaned) if item.strip()]
+    label = brackets[-1] if brackets else re.sub(r"^MT\d+\w*(?:\s+Family)?\s+", "", cleaned).strip()
+    if not label or re.fullmatch(r"device(?:\s+[0-9a-f]{4})?", label, re.IGNORECASE):
+        return f"Mellanox [{MLX_VENDOR}:{device_id}]"
+    return label
+
+
 def _parse_hex_int(value: str | None) -> int | None:
     if not value:
         return None
@@ -845,7 +873,7 @@ def _cpu_sockets(system: dict) -> str | None:
 
 def parse_probe(output: str) -> dict:
     """Parse stable section markers emitted by REMOTE_SCRIPT into cached facts."""
-    result: dict = {"fqdn": None, "adapters": [], "gpus": [], "slots": [], "ports": [], "net": [], "lldp": None, "sys": {}}
+    result: dict = {"fqdn": None, "adapters": [], "gpus": [], "nics": [], "slots": [], "ports": [], "net": [], "lldp": None, "sys": {}}
     section: str | None = None
     sma_key: tuple[str, int] | None = None
     lldp_lines: list[str] = []
@@ -885,15 +913,15 @@ def parse_probe(output: str) -> dict:
                 cur_w, max_w, parent_w = _pcie_width(cur_width), _pcie_width(max_width), _pcie_width(parent_width)
                 link_gen = min(max_gen, parent_gen) if max_gen and parent_gen else (max_gen or cur_gen)
                 link_w = cur_w or (f"x{min(int(max_w[1:]), int(parent_w[1:]))}" if max_w and parent_w else max_w)
-                for gpu in result["gpus"]:
-                    if gpu["pci"] == pci:
+                for device in (*result["gpus"], *result["nics"]):
+                    if device["pci"] == pci:
                         # GPUs drop current_link_speed to 2.5 GT/s (Gen1) at idle; cap the
                         # device's max capability by the root port's max capability so a
                         # slower slot is surfaced while idle power-save is not mistaken for Gen1.
-                        gpu["pcie_gen"] = link_gen
-                        gpu["pcie_width"] = link_w
-                        gpu["pcie_cur"] = " ".join(part for part in (cur_gen, cur_w) if part) or None
-                        gpu["pcie_max"] = " ".join(part for part in (max_gen, max_w) if part) or None
+                        device["pcie_gen"] = link_gen
+                        device["pcie_width"] = link_w
+                        device["pcie_cur"] = " ".join(part for part in (cur_gen, cur_w) if part) or None
+                        device["pcie_max"] = " ".join(part for part in (max_gen, max_w) if part) or None
                 continue
             if line.startswith("SLOT|"):
                 _, pci, max_speed, max_width, cur_speed, cur_width = (line.split("|") + [""] * 6)[:6]
@@ -942,6 +970,28 @@ def parse_probe(output: str) -> dict:
                             "device": device_id,
                             "class": pci_class,
                             "model": _gpu_model(vendor_id, device_id, desc),
+                            "desc": desc,
+                            "pcie_gen": None,
+                            "pcie_width": None,
+                            "pcie_cur": None,
+                            "pcie_max": None,
+                        }
+                    )
+                elif (
+                    vendor_id == MLX_VENDOR
+                    and class_id in MLX_CLASSES
+                    and not _MLX_VF_RE.search(desc)
+                    # Dual-port ConnectX cards expose .0 and .1 functions on the same PCI device;
+                    # record one entry per domain:bus:device so card counts reflect physical NICs.
+                    and not any(nic["pci"].rsplit(".", 1)[0] == pci.rsplit(".", 1)[0] for nic in result["nics"])
+                ):
+                    result["nics"].append(
+                        {
+                            "pci": pci,
+                            "vendor": vendor_id,
+                            "device": device_id,
+                            "class": pci_class,
+                            "model": _mlx_model(device_id, desc),
                             "desc": desc,
                             "pcie_gen": None,
                             "pcie_width": None,
@@ -1024,6 +1074,7 @@ def store_probe(db: sqlite3.Connection, result: dict) -> None:
     )
     db.execute("DELETE FROM adapter WHERE host=?", (host,))
     db.execute("DELETE FROM gpu WHERE host=?", (host,))
+    db.execute("DELETE FROM nic WHERE host=?", (host,))
     db.execute("DELETE FROM slot WHERE host=?", (host,))
     db.execute("DELETE FROM port WHERE host=?", (host,))
     for adapter in probe["adapters"]:
@@ -1031,23 +1082,24 @@ def store_probe(db: sqlite3.Connection, result: dict) -> None:
             "INSERT OR REPLACE INTO adapter VALUES (?,?,?,?,?,?)",
             (host, adapter["pci"], adapter["device"], adapter["gen"], adapter["class"], adapter["desc"]),
         )
-    for gpu in probe["gpus"]:
-        db.execute(
-            "INSERT OR REPLACE INTO gpu VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                host,
-                gpu["pci"],
-                gpu["vendor"],
-                gpu["device"],
-                gpu["class"],
-                gpu["model"],
-                gpu["desc"],
-                gpu["pcie_gen"],
-                gpu["pcie_width"],
-                gpu["pcie_cur"],
-                gpu["pcie_max"],
-            ),
-        )
+    for table, devices in (("gpu", probe["gpus"]), ("nic", probe["nics"])):
+        for device in devices:
+            db.execute(
+                f"INSERT OR REPLACE INTO {table} VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    host,
+                    device["pci"],
+                    device["vendor"],
+                    device["device"],
+                    device["class"],
+                    device["model"],
+                    device["desc"],
+                    device["pcie_gen"],
+                    device["pcie_width"],
+                    device["pcie_cur"],
+                    device["pcie_max"],
+                ),
+            )
     for slot in probe["slots"]:
         db.execute(
             "INSERT OR REPLACE INTO slot VALUES (?,?,?,?,?,?)",
@@ -1377,6 +1429,7 @@ def _cleanup_bogus_discovered_hosts(db: sqlite3.Connection) -> list[str]:
         db.execute("DELETE FROM resource_host WHERE host=?", (host,))
         db.execute("DELETE FROM adapter WHERE host=?", (host,))
         db.execute("DELETE FROM gpu WHERE host=?", (host,))
+        db.execute("DELETE FROM nic WHERE host=?", (host,))
         db.execute("DELETE FROM slot WHERE host=?", (host,))
         db.execute("DELETE FROM port WHERE host=?", (host,))
         db.execute("DELETE FROM host WHERE name=?", (host,))
@@ -1572,11 +1625,13 @@ def _status_data(db: sqlite3.Connection, db_path: Path) -> dict:
         "SELECT count(*), count(probed_at), sum(reachable), min(probed_at), max(probed_at) FROM host"
     ).fetchone()
     gpu_hosts, gpu_devices = db.execute("SELECT count(DISTINCT host), count(*) FROM gpu").fetchone()
+    mlx_hosts, mlx_devices = db.execute("SELECT count(DISTINCT host), count(*) FROM nic").fetchone()
     return {
         "database": str(db_path),
         "booked": {"resources": resource_count, "synced_at": synced_at, "age": _age(synced_at)},
         "hosts": {"known": host_count, "probed": probed_count, "reachable": reachable_count or 0, "unprobed": host_count - probed_count},
         "gpus": {"hosts": gpu_hosts, "devices": gpu_devices},
+        "mellanox": {"hosts": mlx_hosts, "devices": mlx_devices},
         "probes": {"oldest_at": oldest_probe, "newest_at": newest_probe, "newest_age": _age(newest_probe)},
         "hint": _cache_hint(resource_count, synced_at),
     }
@@ -1636,6 +1691,7 @@ def cmd_status(db: sqlite3.Connection, args: argparse.Namespace) -> int:
         f"({status['hosts']['reachable']} reachable), {status['hosts']['unprobed']} never probed"
     )
     print(f"  GPUs:    {status['gpus']['hosts']} probed host(s) ({status['gpus']['devices']} PCIe device(s))")
+    print(f"  Mellanox: {status['mellanox']['hosts']} probed host(s) ({status['mellanox']['devices']} PCIe device(s))")
     print(f"  Probes:  oldest {status['probes']['oldest_at'] or '-'} UTC, newest {status['probes']['newest_at'] or '-'} UTC")
     if status["hint"]:
         print(f"Hint: {status['hint']}")
@@ -1648,8 +1704,8 @@ def host_gen(db: sqlite3.Connection, host: str) -> str:
     return "+".join(sorted(generations)) if generations else "-"
 
 
-def _host_gpus(db: sqlite3.Connection, host: str) -> list[dict]:
-    """Return cached PCIe GPU rows for host in PCI address order."""
+def _host_pci_devices(db: sqlite3.Connection, table: str, host: str) -> list[dict]:
+    """Return cached PCIe device rows from table for host in PCI address order."""
     return [
         {
             "pci_addr": pci,
@@ -1665,15 +1721,20 @@ def _host_gpus(db: sqlite3.Connection, host: str) -> list[dict]:
         }
         for pci, vendor, device, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max in db.execute(
             "SELECT pci_addr, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max "
-            "FROM gpu WHERE host=? ORDER BY pci_addr",
+            f"FROM {table} WHERE host=? ORDER BY pci_addr",
             (host,),
         )
     ]
 
 
-def _booked_gpus(db: sqlite3.Connection, host: str) -> list[str]:
-    """Return distinct non-placeholder Booked GPU attributes mapped to host."""
-    gpus: list[str] = []
+def _host_gpus(db: sqlite3.Connection, host: str) -> list[dict]:
+    """Return cached PCIe GPU rows for host in PCI address order."""
+    return _host_pci_devices(db, "gpu", host)
+
+
+def _booked_attr_values(db: sqlite3.Connection, host: str, predicate: Callable[[str, str], bool]) -> list[str]:
+    """Return distinct non-placeholder Booked custom attribute values for host matching predicate(key, value)."""
+    values: list[str] = []
     rows = db.execute(
         "SELECT r.attrs_json FROM resource_host rh JOIN resource r ON r.id=rh.resource_id "
         "WHERE rh.host=? ORDER BY r.name",
@@ -1683,12 +1744,23 @@ def _booked_gpus(db: sqlite3.Connection, host: str) -> list[str]:
         if not attrs_json:
             continue
         try:
-            gpu = (json.loads(attrs_json).get("GPU") or "").strip()
+            attrs = json.loads(attrs_json)
         except json.JSONDecodeError:
-            gpu = ""
-        if gpu and gpu.lower() not in _NO_GPU_VALUES and gpu not in gpus:
-            gpus.append(gpu)
-    return gpus
+            continue
+        if not isinstance(attrs, dict):
+            continue
+        for key, raw_val in attrs.items():
+            value = str(raw_val or "").strip()
+            if not value or value.lower() in _NO_GPU_VALUES:
+                continue
+            if predicate(key.strip().lower(), value) and value not in values:
+                values.append(value)
+    return values
+
+
+def _booked_gpus(db: sqlite3.Connection, host: str) -> list[str]:
+    """Return distinct non-placeholder Booked GPU attributes mapped to host."""
+    return _booked_attr_values(db, host, lambda key, _: key == "gpu")
 
 
 def _gpu_label(gpu: dict) -> str:
@@ -1706,17 +1778,22 @@ def _pcie_link_text(gpu: dict) -> str | None:
     return f"PCIe {pcie}"
 
 
-def host_gpu(db: sqlite3.Connection, host: str, gpus: list[dict] | None = None) -> str:
-    """Summarize PCIe-probed GPUs for host, falling back to Booked GPU metadata when none are probed."""
-    rows = _host_gpus(db, host) if gpus is None else gpus
-    labels = [_gpu_label(gpu) for gpu in rows if gpu.get("model")]
+def _summarize_pci_devices(rows: list[dict], booked_fallback: Callable[[], list[str]]) -> str:
+    """Summarize probed PCIe devices by count and model, falling back to Booked metadata."""
+    labels = [_gpu_label(row) for row in rows if row.get("model")]
     if labels:
         counts: dict[str, int] = {}
         for label in labels:
             counts[label] = counts.get(label, 0) + 1
         return " + ".join(f"{count}x {label}" if count > 1 else label for label, count in counts.items())
-    booked = _booked_gpus(db, host)
+    booked = booked_fallback()
     return " + ".join(booked) if booked else "-"
+
+
+def host_gpu(db: sqlite3.Connection, host: str, gpus: list[dict] | None = None) -> str:
+    """Summarize PCIe-probed GPUs for host, falling back to Booked GPU metadata when none are probed."""
+    rows = _host_gpus(db, host) if gpus is None else gpus
+    return _summarize_pci_devices(rows, lambda: _booked_gpus(db, host))
 
 
 def _matches_gpu(filter_value: str | None, gpu_summary: str, gpus: list[dict]) -> bool:
@@ -1745,6 +1822,59 @@ def _matches_gpu(filter_value: str | None, gpu_summary: str, gpus: list[dict]) -
                 gpu.get("pcie_width"),
                 gpu.get("pcie_cur"),
                 gpu.get("pcie_max"),
+            )
+            if item
+        )
+    return needle in " ".join(parts).lower()
+
+
+def _host_nics(db: sqlite3.Connection, host: str) -> list[dict]:
+    """Return cached PCIe Mellanox NIC rows for host in PCI address order."""
+    return _host_pci_devices(db, "nic", host)
+
+
+def _booked_nics(db: sqlite3.Connection, host: str) -> list[str]:
+    """Return distinct non-placeholder Booked Mellanox NIC attributes mapped to host."""
+    return _booked_attr_values(
+        db,
+        host,
+        lambda key, value: key in _MLX_BOOKED_KEYS or (key in _MLX_CARD_KEYS and bool(_MLX_ATTR_RE.search(value))),
+    )
+
+
+def host_mlx(db: sqlite3.Connection, host: str, nics: list[dict] | None = None) -> str:
+    """Summarize PCIe-probed Mellanox NICs for host, falling back to Booked metadata when none are probed."""
+    rows = _host_nics(db, host) if nics is None else nics
+    return _summarize_pci_devices(rows, lambda: _booked_nics(db, host))
+
+
+def _matches_mlx(filter_value: str | None, mlx_summary: str, nics: list[dict]) -> bool:
+    if filter_value is None:
+        return True
+    needle = filter_value.strip().lower()
+    if needle in ("", "*", "any", "yes", "true"):
+        return mlx_summary != "-"
+    if needle in ("none", "no", "false", "-"):
+        return mlx_summary == "-"
+    if mlx_summary == "-":
+        return False
+    parts = [mlx_summary, re.sub(r"connectx-?", "cx", mlx_summary, flags=re.IGNORECASE), "mellanox", "mlx", "nvidia"]
+    for nic in nics:
+        model = nic.get("model") or ""
+        parts.extend(
+            str(item)
+            for item in (
+                nic["pci_addr"],
+                f"{nic['vendor_id']}:{nic['device_id']}",
+                nic["device_id"],
+                nic["pci_class"],
+                model,
+                re.sub(r"connectx-?", "cx", model, flags=re.IGNORECASE),
+                nic["description"],
+                nic.get("pcie_gen"),
+                nic.get("pcie_width"),
+                nic.get("pcie_cur"),
+                nic.get("pcie_max"),
             )
             if item
         )
@@ -1973,6 +2103,9 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
         gpus = _host_gpus(db, name)
         gpu = host_gpu(db, name, gpus)
         gpu_source = "pcie" if gpus else ("booked" if gpu != "-" else None)
+        nics = _host_nics(db, name)
+        mlx = host_mlx(db, name, nics)
+        mlx_source = "pcie" if nics else ("booked" if mlx != "-" else None)
         slots = _host_slots(db, name)
         slot_summary = host_slots(db, name, slots)
         platform = ((args.model, entry["model"]), (args.os, entry["os"]))
@@ -1983,6 +2116,8 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
         if not _matches_cpu(args.cpu, entry["cpu"], kernels.get(name)):
             continue
         if not _matches_gpu(getattr(args, "gpu", None), gpu, gpus):
+            continue
+        if not _matches_mlx(getattr(args, "mlx", None), mlx, nics):
             continue
         if not _matches_slots(getattr(args, "pcie", None), slot_summary, slots):
             continue
@@ -2010,6 +2145,9 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
                 "gpu": None if gpu == "-" else gpu,
                 "gpu_count": len(gpus),
                 "gpu_source": gpu_source,
+                "mlx": None if mlx == "-" else mlx,
+                "mlx_count": len(nics),
+                "mlx_source": mlx_source,
                 "pcie_slots": None if slot_summary == "-" else slot_summary,
                 "gen5_slots": sum((slot.get("pcie_gen") or "") >= "Gen5" for slot in slots),
                 "resources": [resource["name"] for resource in entry["resources"]],
@@ -2028,6 +2166,7 @@ def _list_entries(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
         "CN6000": sum(entry["generation"] == "CN6000" for entry in entries),
         "mixed": sum("+" in entry["generation"] for entry in entries),
         "gpu": sum(bool(entry["gpu"]) for entry in entries),
+        "mlx": sum(bool(entry["mlx"]) for entry in entries),
         "unprobed": sum(entry["probed_at"] is None for entry in entries),
     }
     return entries, summary
@@ -2044,7 +2183,15 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     entries, summary = _list_entries(db, args)
     resource_count, synced_at = db.execute("SELECT count(*), max(synced_at) FROM resource").fetchone()
     hint = _cache_hint(resource_count, synced_at)
-    probe_filters = args.model or args.cpu or args.os or getattr(args, "pcie", None) or (args.gen and args.gen.lower() != "unprobed")
+    mlx_filter = getattr(args, "mlx", None)
+    probe_filters = (
+        args.model
+        or args.cpu
+        or args.os
+        or (mlx_filter and mlx_filter.strip().lower() not in ("none", "no", "false", "-"))
+        or getattr(args, "pcie", None)
+        or (args.gen and args.gen.lower() != "unprobed")
+    )
     if not hint and probe_filters:
         unprobed = db.execute("SELECT count(*) FROM host WHERE probed_at IS NULL").fetchone()[0]
         if unprobed:
@@ -2060,12 +2207,15 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     wide = bool(args.wide or args.model or args.cpu or args.os)
     show_gpu = bool(wide or getattr(args, "gpu", None))
+    show_mlx = bool(wide or getattr(args, "mlx", None))
     show_slots = bool(wide or getattr(args, "pcie", None))
     header = f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'LINK':<10} {'BOOKED':<42}" if wide else f"{'HOST':<26} {'GEN':<14} {'REACH':<9} {'LINK':<10} {'BOOKED':<12}"
     if wide:
         header += f" {'MODEL':<34} {'CPU':<44}"
     if show_gpu:
         header += f" {'GPU':<38}"
+    if show_mlx:
+        header += f" {'MLX':<34}"
     if show_slots:
         header += f" {'SLOTS':<24}"
     if wide:
@@ -2087,11 +2237,14 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
         booked_color = {"free": "32", "in use": "33", "unavailable": "31"}.get(entry["booked_status"])
         rendered_booked = _paint(f"{booked:<42}" if wide else f"{booked:<12}", booked_color) if booked_color else (f"{booked:<42}" if wide else f"{booked:<12}")
         gpu_text = f"{entry['gpu']} (Booked)" if entry.get("gpu_source") == "booked" else entry["gpu"]
+        mlx_text = f"{entry['mlx']} (Booked)" if entry.get("mlx_source") == "booked" else entry["mlx"]
         row_cells = f"{rendered_host} {rendered_gen} {reach:<9} {rendered_link} {rendered_booked}"
         if wide:
             row_cells += f" {_short(entry['model'], 34):<34} {_short(entry['cpu'], 44):<44}"
         if show_gpu:
             row_cells += f" {_short(gpu_text, 38):<38}"
+        if show_mlx:
+            row_cells += f" {_short(mlx_text, 34):<34}"
         if show_slots:
             row_cells += f" {_short(entry['pcie_slots'], 24):<24}"
         if wide:
@@ -2100,7 +2253,7 @@ def cmd_list(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     print(
         f"{summary['hosts']} host{'s' if summary['hosts'] != 1 else ''} "
         f"({summary['CN5000']} CN5000, {summary['CN6000']} CN6000, "
-        f"{summary['mixed']} mixed, {summary['gpu']} GPU, {summary['unprobed']} unprobed)"
+        f"{summary['mixed']} mixed, {summary['gpu']} GPU, {summary['mlx']} Mellanox, {summary['unprobed']} unprobed)"
     )
     if hint:
         print(f"Hint: {hint}")
@@ -2205,6 +2358,8 @@ def _resource_detail(db: sqlite3.Connection, resource_id: int) -> dict:
             "generation": host_gen(db, host),
             "gpu": None if (gpu := host_gpu(db, host, gpus := _host_gpus(db, host))) == "-" else gpu,
             "gpu_source": "pcie" if gpus else ("booked" if gpu != "-" else None),
+            "mlx": None if (mlx := host_mlx(db, host, nics := _host_nics(db, host))) == "-" else mlx,
+            "mlx_source": "pcie" if nics else ("booked" if mlx != "-" else None),
             "reachable": bool(reachable) if probed_at else None,
             "probed_at": probed_at,
         }
@@ -2292,6 +2447,9 @@ def _host_detail(db: sqlite3.Connection, host: str) -> dict:
     gpus = _host_gpus(db, host)
     gpu_summary = host_gpu(db, host, gpus)
     gpu_source = "pcie" if gpus else ("booked" if gpu_summary != "-" else None)
+    nics = _host_nics(db, host)
+    mlx_summary = host_mlx(db, host, nics)
+    mlx_source = "pcie" if nics else ("booked" if mlx_summary != "-" else None)
     slots = _host_slots(db, host)
     slot_summary = host_slots(db, host, slots)
     return {
@@ -2299,6 +2457,8 @@ def _host_detail(db: sqlite3.Connection, host: str) -> dict:
         "generation": host_gen(db, row[0]),
         "gpu": None if gpu_summary == "-" else gpu_summary,
         "gpu_source": gpu_source,
+        "mlx": None if mlx_summary == "-" else mlx_summary,
+        "mlx_source": mlx_source,
         "pcie_slots": None if slot_summary == "-" else slot_summary,
         "probed_at": row[1],
         "reachable": bool(row[2]) if row[1] else None,
@@ -2314,6 +2474,7 @@ def _host_detail(db: sqlite3.Connection, host: str) -> dict:
         "resources": resources,
         "adapters": adapters,
         "gpus": gpus,
+        "nics": nics,
         "slots": slots,
         "ports": _port_detail(db, host),
     }
@@ -2366,16 +2527,18 @@ def _print_resource_detail(detail: dict, indent: str = "") -> None:
             reach = "unprobed" if host["reachable"] is None else ("yes" if host["reachable"] else "no")
             gpu_val = f"{host['gpu']} (Booked)" if host.get("gpu_source") == "booked" else host.get("gpu")
             gpu = f"  gpu={gpu_val}" if gpu_val else ""
+            mlx_val = f"{host['mlx']} (Booked)" if host.get("mlx_source") == "booked" else host.get("mlx")
+            mlx = f"  mlx={mlx_val}" if mlx_val else ""
             power = f"  power={_power_text(host['power'])}" if "power" in host else ""
-            print(f"{indent}    {host['host']}  gen={host['generation']}{gpu}  reachable={reach}{power}")
+            print(f"{indent}    {host['host']}  gen={host['generation']}{gpu}{mlx}  reachable={reach}{power}")
 
 
 def _print_host_detail(detail: dict) -> None:
-    """Render every non-empty cached host, adapter, GPU, slot, port, and resource fact."""
+    """Render every non-empty cached host, adapter, GPU, NIC, slot, port, and resource fact."""
     print(f"Host: {detail['host']}")
-    for label, key in (("Generation", "generation"), ("GPU", "gpu"), ("PCIe slots", "pcie_slots"), ("Source", "source"), ("FQDN", "fqdn"), ("Probed", "probed_at"), ("Model", "model"), ("CPU", "cpu"), ("Sockets", "sockets"), ("Cores", "cores"), ("OS", "os"), ("Kernel", "kernel"), ("Error", "error")):
+    for label, key in (("Generation", "generation"), ("GPU", "gpu"), ("Mellanox NIC", "mlx"), ("PCIe slots", "pcie_slots"), ("Source", "source"), ("FQDN", "fqdn"), ("Probed", "probed_at"), ("Model", "model"), ("CPU", "cpu"), ("Sockets", "sockets"), ("Cores", "cores"), ("OS", "os"), ("Kernel", "kernel"), ("Error", "error")):
         if detail[key] is not None:
-            value = f"{detail[key]} (Booked)" if key == "gpu" and detail.get("gpu_source") == "booked" else detail[key]
+            value = f"{detail[key]} (Booked)" if key in ("gpu", "mlx") and detail.get(f"{key}_source") == "booked" else detail[key]
             print(f"  {label}: {value}")
     if detail["reachable"] is not None:
         print(f"  Reachable: {'yes' if detail['reachable'] else 'no'}")
@@ -2391,6 +2554,11 @@ def _print_host_detail(detail: dict) -> None:
         print("  GPUs:")
         for gpu in detail["gpus"]:
             fields = [gpu["pci_addr"], gpu["model"], f"[{gpu['vendor_id']}:{gpu['device_id']}]", _pcie_link_text(gpu), gpu["pci_class"], gpu["description"]]
+            print("    " + "  ".join(str(field) for field in fields if field))
+    if detail.get("nics"):
+        print("  Mellanox NICs:")
+        for nic in detail["nics"]:
+            fields = [nic["pci_addr"], nic["model"], f"[{nic['vendor_id']}:{nic['device_id']}]", _pcie_link_text(nic), nic["pci_class"], nic["description"]]
             print("    " + "  ".join(str(field) for field in fields if field))
     if detail.get("slots"):
         print("  Slots:")
@@ -2800,14 +2968,15 @@ def build_parser() -> argparse.ArgumentParser:
         "list",
         aliases=["ls"],
         help_text="List cached hosts; refreshes Booked availability older than five minutes unless --offline is used.",
-        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --gpu\n  cnhwinv list --gpu nvidia --available\n  cnhwinv list --available\n  cnhwinv list --link down --gen 5k\n  cnhwinv list --offline --source discovered --json\n  cnhwinv ls --gen 5k -o csv > cn5000.csv\n  cnhwinv ls -o tsv | awk -F'\\t' '$3==\"yes\"{print $1}'",
+        examples="cnhwinv ls --gen 6k --reachable -w\n  cnhwinv list --gpu\n  cnhwinv list --gpu nvidia --available\n  cnhwinv list --mlx\n  cnhwinv list --mlx connectx-7 --available\n  cnhwinv list --available\n  cnhwinv list --link down --gen 5k\n  cnhwinv list --offline --source discovered --json\n  cnhwinv ls --gen 5k -o csv > cn5000.csv\n  cnhwinv ls -o tsv | awk -F'\\t' '$3==\"yes\"{print $1}'",
     )
     listing.add_argument("--gen", type=_generation_argument, metavar="GEN", help="5k/6k/CN5000/CN6000, mixed, none, or unprobed")
     listing.add_argument("--reachable", action="store_true", help="only latest probes that were reachable")
-    listing.add_argument("--wide", "-w", action="store_true", help="also show server model, CPU, GPU, PCIe slots, and OS")
+    listing.add_argument("--wide", "-w", action="store_true", help="also show server model, CPU, GPU, Mellanox NIC, PCIe slots, and OS")
     listing.add_argument("--model", help="filter server model substring (case-insensitive)")
     listing.add_argument("--cpu", help="filter CPU model or architecture, e.g. epyc, xeon, arm, neoverse (case-insensitive)")
     listing.add_argument("--gpu", nargs="?", const="*", metavar="GPU", help="only hosts with a GPU, or filter GPU model/vendor substring (or 'none')")
+    listing.add_argument("--mlx", "--mellanox", "--nic", dest="mlx", nargs="?", const="*", metavar="NIC", help="only hosts with a Mellanox NIC, or filter NIC model/device substring (or 'none')")
     listing.add_argument("--pcie", "--slots", dest="pcie", nargs="?", const="*", metavar="SLOTS", help="filter PCIe slots, e.g. gen5, '2x gen5', '4x gen5 x16', gen6 (or 'none')")
     listing.add_argument("--os", help="filter OS substring (case-insensitive)")
     listing.add_argument("--source", choices=["booked", "discovered"], help="filter Booked or fabric-discovered hosts")
@@ -2890,6 +3059,10 @@ def open_db(path: Path) -> sqlite3.Connection:
         for column in ("pcie_gen", "pcie_width", "pcie_cur", "pcie_max"):
             if column not in gpu_columns:
                 db.execute(f"ALTER TABLE gpu ADD COLUMN {column} TEXT")
+        nic_columns = {row[1] for row in db.execute("PRAGMA table_info(nic)")}
+        for column in ("pcie_gen", "pcie_width", "pcie_cur", "pcie_max"):
+            if column not in nic_columns:
+                db.execute(f"ALTER TABLE nic ADD COLUMN {column} TEXT")
         db.commit()
         return db
     except (OSError, sqlite3.Error) as error:

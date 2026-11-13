@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 from datetime import datetime, timezone
 import io
 import json
@@ -20,6 +21,11 @@ _TEST_HOME = tempfile.TemporaryDirectory()
 os.environ["XDG_DATA_HOME"] = _TEST_HOME.name
 os.environ["XDG_STATE_HOME"] = _TEST_HOME.name
 
+_ROOT = Path(__file__).resolve().parents[1]
+for _candidate in (_ROOT, _ROOT / "bin"):
+    if (_candidate / "cnhwinv.py").is_file() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
+
 import cnhwinv as bi
 
 
@@ -36,9 +42,11 @@ SYS|kernel|5.14.0-test
 0000:0b:00.0 3D controller [0302]: NVIDIA Corporation AD102GL [L40S] [10de:26b9] (rev a1)
 0000:35:00.0 VGA compatible controller [0300]: Matrox Electronics Systems Ltd. Integrated Matrox G200eW3 Graphics Controller [102b:0536] (rev 08)
 0000:41:00.0 Network controller [0280]: Cornelis Networks Inc CN5000 [434e:0001]
+0000:5c:00.0 Infiniband controller [0207]: Mellanox Technologies MT2910 Family [ConnectX-7] [15b3:1021]
 0000:81:00.0 Network controller [0280]: Cornelis Networks Inc CN6000 [434e:0002]
 0001:0b:00.0 3D controller [0302]: NVIDIA Corporation AD102GL [L40S] [10de:26b9] (rev a1)
 PCIE|0000:0b:00.0|2.5 GT/s PCIe|16|16.0 GT/s PCIe|16|32.0 GT/s PCIe|16
+PCIE|0000:5c:00.0|32.0 GT/s PCIe|16|32.0 GT/s PCIe|16|32.0 GT/s PCIe|16
 PCIE|0001:0b:00.0|16.0 GT/s PCIe|16|16.0 GT/s PCIe|16|32.0 GT/s PCIe|16
 SLOT|0000:0a:02.0|32.0 GT/s PCIe|16|2.5 GT/s PCIe|16
 SLOT|0000:5b:02.0|32.0 GT/s PCIe|16|32.0 GT/s PCIe|16
@@ -135,6 +143,28 @@ class InventoryTestCase(unittest.TestCase):
     ) -> None:
         self.db.execute(
             "INSERT INTO gpu(host, pci_addr, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (host, pci, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max),
+        )
+        self.db.commit()
+
+    def add_nic(
+        self,
+        host: str,
+        pci: str = "0000:5c:00.0",
+        *,
+        vendor_id: str = "15b3",
+        device_id: str = "1021",
+        pci_class: str = "Infiniband controller",
+        model: str = "ConnectX-7",
+        description: str = "Mellanox Technologies MT2910 Family [ConnectX-7]",
+        pcie_gen: str | None = "Gen5",
+        pcie_width: str | None = "x16",
+        pcie_cur: str | None = "Gen5 x16",
+        pcie_max: str | None = "Gen5 x16",
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO nic(host, pci_addr, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (host, pci, vendor_id, device_id, pci_class, model, description, pcie_gen, pcie_width, pcie_cur, pcie_max),
         )
@@ -291,6 +321,9 @@ CN-HOST01
         self.assertIs(run.call_args.kwargs["stdin"], bi.subprocess.DEVNULL)
         self.assertNotIn("input", run.call_args.kwargs)
         self.assertNotIn("sudo", bi.REMOTE_SCRIPT)
+        self.assertIn("15b3", bi.REMOTE_SCRIPT)
+        self.assertIn("physfn", bi.REMOTE_SCRIPT)
+        self.assertIn("Virtual Function", bi.REMOTE_SCRIPT)
 
     def test_booked_transport_error_is_a_friendly_user_error(self) -> None:
         with mock.patch.object(bi.urllib.request, "urlopen", side_effect=bi.urllib.error.URLError("offline")):
@@ -304,6 +337,8 @@ CN-HOST01
         self.assertEqual(parsed["sys"]["cpu"], "Intel(R) Xeon(R) Gold 6430")
         self.assertEqual([adapter["gen"] for adapter in parsed["adapters"]], ["CN5000", "CN6000"])
         self.assertEqual([gpu["model"] for gpu in parsed["gpus"]], ["NVIDIA L40S", "NVIDIA L40S"])
+        self.assertEqual([nic["model"] for nic in parsed["nics"]], ["ConnectX-7"])
+        self.assertEqual((parsed["nics"][0]["pcie_gen"], parsed["nics"][0]["pcie_width"]), ("Gen5", "x16"))
         self.assertEqual(parsed["ports"][0]["neighbor_guid"], "0x8899aabbccddeeff")
         self.assertEqual(parsed["ports"][0]["neighbor_port"], 2)
         self.assertEqual(parsed["net"][0]["netdev"], "ens1")
@@ -326,6 +361,7 @@ opasmaquery: failed to open port: Device or resource busy
         old = sqlite3.connect(self.db_path)
         old.execute("CREATE TABLE host (name TEXT PRIMARY KEY, probed_at TEXT, reachable INTEGER, error TEXT, fqdn TEXT)")
         old.execute("CREATE TABLE gpu (host TEXT, pci_addr TEXT, vendor_id TEXT, device_id TEXT, pci_class TEXT, model TEXT, description TEXT, PRIMARY KEY (host, pci_addr))")
+        old.execute("CREATE TABLE nic (host TEXT, pci_addr TEXT, vendor_id TEXT, device_id TEXT, pci_class TEXT, model TEXT, description TEXT, PRIMARY KEY (host, pci_addr))")
         old.commit()
         old.close()
         self.db = bi.open_db(self.db_path)
@@ -333,6 +369,8 @@ opasmaquery: failed to open port: Device or resource busy
         self.assertTrue({"source", "model", "cpu", "sockets", "cores", "os", "kernel"}.issubset(columns))
         gpu_columns = {row[1] for row in self.db.execute("PRAGMA table_info(gpu)")}
         self.assertTrue({"pcie_gen", "pcie_width", "pcie_cur", "pcie_max"}.issubset(gpu_columns))
+        nic_columns = {row[1] for row in self.db.execute("PRAGMA table_info(nic)")}
+        self.assertTrue({"pcie_gen", "pcie_width", "pcie_cur", "pcie_max"}.issubset(nic_columns))
         bi.store_probe(self.db, {"host": "cn-host01", "out": PROBE_OUTPUT})
         self.db.commit()
         row = self.db.execute("SELECT reachable, model, cpu, os FROM host WHERE name='cn-host01'").fetchone()
@@ -346,6 +384,11 @@ opasmaquery: failed to open port: Device or resource busy
                 ("0000:0b:00.0", "10de", "NVIDIA L40S", "Gen4", "x16", "Gen1 x16", "Gen4 x16"),
                 ("0001:0b:00.0", "10de", "NVIDIA L40S", "Gen4", "x16", "Gen4 x16", "Gen4 x16"),
             ],
+        )
+        nics = self.db.execute("SELECT pci_addr, vendor_id, model, pcie_gen, pcie_width, pcie_cur, pcie_max FROM nic WHERE host='cn-host01' ORDER BY pci_addr").fetchall()
+        self.assertEqual(
+            [tuple(nic) for nic in nics],
+            [("0000:5c:00.0", "15b3", "ConnectX-7", "Gen5", "x16", "Gen5 x16", "Gen5 x16")],
         )
 
     def test_host_gen_classifies_single_mixed_and_unprobed_hosts(self) -> None:
@@ -972,8 +1015,9 @@ opasmaquery: failed to open port: Device or resource busy
             ["refresh", "--jobs", "2"],
             ["discover", "--jobs", "2", "--timeout", "5"],
             ["status"],
-            ["list", "--gen", "5000", "--reachable", "--wide", "--model", "SR655", "--cpu", "EPYC", "--os", "Rocky", "--source", "booked", "--available", "--link", "up", "--offline"],
-            ["ls", "--gen", "CN6000"],
+            ["list", "--gen", "5000", "--reachable", "--wide", "--model", "SR655", "--cpu", "EPYC", "--mlx", "ConnectX-7", "--os", "Rocky", "--source", "booked", "--available", "--link", "up", "--offline"],
+            ["ls", "--gen", "CN6000", "--mellanox"],
+            ["list", "--nic", "none"],
             ["show", "host01", "--offline"],
             ["links", "--gen", "6000"],
         ]
@@ -1510,6 +1554,289 @@ SYS|kernel|5.14.0-427.el9.aarch64
         self.assertNotIn("no-os-release01", stale)
         self.assertNotIn("arm-grace01", stale)
         self.assertNotIn("x86-epyc01", stale)
+
+    def test_mlx_model_and_host_mlx_summarize_probed_and_booked_nics(self) -> None:
+        self.assertEqual(
+            bi._mlx_model("1021", "Mellanox Technologies MT2910 Family [ConnectX-7]"),
+            "ConnectX-7",
+        )
+        self.assertEqual(
+            bi._mlx_model("101d", "Mellanox Technologies MT2892 Family [ConnectX-6 Dx]"),
+            "ConnectX-6 Dx",
+        )
+        self.assertEqual(
+            bi._mlx_model("1019", "Mellanox Technologies MT28800 Family [ConnectX-5 Ex]"),
+            "ConnectX-5 Ex",
+        )
+        self.assertEqual(
+            bi._mlx_model("a2dc", "Mellanox Technologies MT43244 Family [BlueField-3 integrated ConnectX-7 network controller]"),
+            "BlueField-3 integrated ConnectX-7 network controller",
+        )
+        self.assertEqual(
+            bi._mlx_model("a2dc", "Mellanox Technologies MT43244 BlueField-3 integrated ConnectX-7 network controller"),
+            "BlueField-3 integrated ConnectX-7 network controller",
+        )
+        self.assertEqual(
+            bi._mlx_model("1023", "Mellanox Technologies Device 1023"),
+            "Mellanox [15b3:1023]",
+        )
+        parsed = bi.parse_probe(
+            "@@LSPCI\n"
+            "0000:41:00.0 Ethernet controller [0200]: Mellanox Technologies MT2892 Family [ConnectX-6 Dx] [15b3:101d]\n"
+            "0000:41:00.1 Ethernet controller [0200]: Mellanox Technologies MT2892 Family [ConnectX-6 Dx] [15b3:101d]\n"
+            "0000:41:00.2 Ethernet controller [0200]: Mellanox Technologies ConnectX-6 Dx Virtual Function [15b3:101e]\n"
+            "0000:b0:00.0 PCI bridge [0604]: Mellanox Technologies MT43244 BlueField-3 PCIe Switch [15b3:197b]\n"
+            "0000:b1:00.0 Infiniband controller [0207]: Mellanox Technologies MT2910 Family [ConnectX-7] [15b3:1021]\n"
+            "0000:b1:00.2 DMA controller [0880]: Mellanox Technologies MT43244 BlueField-3 SoC Management Interface [15b3:a2da]\n"
+            "PCIE|0000:41:00.0|16.0 GT/s PCIe|16|16.0 GT/s PCIe|16|32.0 GT/s PCIe|16\n"
+            "PCIE|0000:b1:00.0|2.5 GT/s PCIe|16|32.0 GT/s PCIe|16|16.0 GT/s PCIe|8\n"
+            "@@DONE\n"
+        )
+        self.assertEqual([(nic["pci"], nic["model"]) for nic in parsed["nics"]], [("0000:41:00.0", "ConnectX-6 Dx"), ("0000:b1:00.0", "ConnectX-7")])
+        self.assertEqual((parsed["nics"][0]["pcie_gen"], parsed["nics"][0]["pcie_width"]), ("Gen4", "x16"))
+        self.assertEqual(
+            (parsed["nics"][1]["pcie_gen"], parsed["nics"][1]["pcie_width"], parsed["nics"][1]["pcie_cur"], parsed["nics"][1]["pcie_max"]),
+            ("Gen4", "x16", "Gen1 x16", "Gen5 x16"),
+        )
+
+        bi.store_probe(self.db, {"host": "reprobe-mlx01", "out": PROBE_OUTPUT})
+        self.assertEqual(len(bi._host_nics(self.db, "reprobe-mlx01")), 1)
+        bi.store_probe(self.db, {"host": "reprobe-mlx01", "out": "@@LSPCI\n@@DONE\n"})
+        self.assertEqual(bi._host_nics(self.db, "reprobe-mlx01"), [])
+        self.db.execute("INSERT INTO host(name, source) VALUES ('jkr', 'discovered')")
+        self.add_nic("jkr", "0000:5c:00.0")
+        self.assertEqual(bi._cleanup_bogus_discovered_hosts(self.db), ["jkr"])
+        self.assertEqual(bi._host_nics(self.db, "jkr"), [])
+
+        self.add_host("dual-mlx01")
+        self.add_nic("dual-mlx01", "0000:41:00.0", device_id="101d", pci_class="Ethernet controller", model="ConnectX-6 Dx", pcie_gen="Gen4", pcie_width="x16")
+        self.add_nic("dual-mlx01", "0000:81:00.0", device_id="101d", pci_class="Ethernet controller", model="ConnectX-6 Dx", pcie_gen="Gen4", pcie_width="x16")
+        self.add_host("legacy-mlx01")
+        self.add_nic("legacy-mlx01", "0000:5c:00.0", model="ConnectX-7", pcie_gen=None, pcie_width=None, pcie_cur=None, pcie_max=None)
+        self.add_host("booked-mlx01", reachable=0)
+        self.add_resource(1, "MLX-DEV-01", ["booked-mlx01"])
+        self.db.execute("UPDATE resource SET attrs_json=? WHERE id=1", (json.dumps({"Mellanox": "ConnectX-7"}),))
+        self.add_host("booked-card01", reachable=0)
+        self.add_resource(2, "MLX-DEV-02", ["booked-card01"])
+        self.db.execute("UPDATE resource SET attrs_json=? WHERE id=2", (json.dumps({"Internal Card": "Mellanox ConnectX-6 Dx"}),))
+        self.add_host("placeholder-mlx01")
+        self.add_resource(3, "Placeholder-MLX", ["placeholder-mlx01"])
+        self.db.execute(
+            "UPDATE resource SET attrs_json=? WHERE id=3",
+            (json.dumps({"Mellanox": "None", "NIC": "CN5000", "Switch": "Mellanox QM9700"}),),
+        )
+        self.add_host("nomlx01")
+        self.db.commit()
+
+        self.assertEqual(bi.host_mlx(self.db, "dual-mlx01"), "2x ConnectX-6 Dx (Gen4 x16)")
+        self.assertEqual(bi.host_mlx(self.db, "legacy-mlx01"), "ConnectX-7")
+        self.assertEqual(bi.host_mlx(self.db, "booked-mlx01"), "ConnectX-7")
+        self.assertEqual(bi.host_mlx(self.db, "booked-card01"), "Mellanox ConnectX-6 Dx")
+        self.assertEqual(bi.host_mlx(self.db, "placeholder-mlx01"), "-")
+        self.assertEqual(bi.host_mlx(self.db, "nomlx01"), "-")
+        short_mlx = bi._short("BlueField-3 integrated ConnectX-7 network controller (Gen5 x16)", 34)
+        self.assertEqual(len(short_mlx), 34)
+        self.assertTrue(short_mlx.endswith("(Gen5 x16)"))
+
+    def test_list_show_and_status_report_and_filter_mellanox_nics(self) -> None:
+        self.add_host("mlx-cx7-01")
+        self.add_adapter("mlx-cx7-01", "0000:01:00.0", "CN6000")
+        self.add_nic("mlx-cx7-01", "0000:5c:00.0", model="ConnectX-7", pcie_gen="Gen5", pcie_width="x16", pcie_cur="Gen1 x16", pcie_max="Gen5 x16")
+        self.add_nic("mlx-cx7-01", "0001:5c:00.0", model="ConnectX-7", pcie_gen="Gen5", pcie_width="x16", pcie_cur="Gen5 x16", pcie_max="Gen5 x16")
+        self.add_resource(1, "mlx_b2b_01", ["mlx-cx7-01"])
+
+        self.add_host("mlx-cx6-01")
+        self.add_nic(
+            "mlx-cx6-01",
+            "0000:41:00.0",
+            device_id="101d",
+            pci_class="Ethernet controller",
+            model="ConnectX-6 Dx",
+            description="Mellanox Technologies MT2892 Family [ConnectX-6 Dx]",
+            pcie_gen="Gen4",
+            pcie_width="x16",
+            pcie_cur="Gen4 x16",
+            pcie_max="Gen4 x16",
+        )
+        self.add_host("cn-only01")
+        self.add_host("booked-mlx-only01", reachable=0)
+        self.add_resource(2, "MLX-DEV-02", ["booked-mlx-only01"])
+        self.db.execute("UPDATE resource SET attrs_json=? WHERE id=2", (json.dumps({"NIC": "ConnectX-5 Ex"}),))
+        self.db.commit()
+
+        code, text, _ = self.run_cli("list", "--offline", "--mlx")
+        self.assertEqual(code, 0)
+        self.assertIn("MLX", text.splitlines()[0])
+        self.assertIn("mlx-cx7-01", text)
+        self.assertIn("2x ConnectX-7 (Gen5 x16)", text)
+        self.assertIn("mlx-cx6-01", text)
+        self.assertIn("ConnectX-6 Dx (Gen4 x16)", text)
+        self.assertIn("ConnectX-5 Ex (Booked)", text)
+        self.assertNotIn("cn-only01", text)
+        self.assertIn("3 Mellanox", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "-w")
+        self.assertEqual(code, 0)
+        self.assertIn("MLX", text.splitlines()[0])
+        self.assertIn("2x ConnectX-7 (Gen5 x16)", text)
+        self.assertIn("ConnectX-6 Dx (Gen4 x16)", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "--mellanox", "15b3:1021", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(text)
+        self.assertEqual([h["host"] for h in payload["hosts"]], ["mlx-cx7-01"])
+        self.assertEqual(payload["hosts"][0]["mlx"], "2x ConnectX-7 (Gen5 x16)")
+        self.assertEqual(payload["hosts"][0]["mlx_count"], 2)
+        self.assertEqual(payload["hosts"][0]["mlx_source"], "pcie")
+        self.assertEqual(payload["summary"]["mlx"], 1)
+
+        code, text, _ = self.run_cli("list", "--offline", "--nic", "cx6", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual([h["host"] for h in json.loads(text)["hosts"]], ["mlx-cx6-01"])
+
+        code, text, _ = self.run_cli("list", "--offline", "--mlx", "bluefield", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(text)["hosts"], [])
+
+        code, text, _ = self.run_cli("list", "--offline", "--mlx", "none")
+        self.assertEqual(code, 0)
+        self.assertIn("cn-only01", text)
+        self.assertNotIn("mlx-cx7-01", text)
+        self.assertNotIn("mlx-cx6-01", text)
+        self.assertNotIn("booked-mlx-only01", text)
+
+        code, text, _ = self.run_cli("list", "--offline", "-o", "csv")
+        self.assertEqual(code, 0)
+        rows = {row["host"]: row for row in csv.DictReader(io.StringIO(text))}
+        self.assertEqual(
+            (rows["mlx-cx7-01"]["mlx"], rows["mlx-cx7-01"]["mlx_count"], rows["mlx-cx7-01"]["mlx_source"]),
+            ("2x ConnectX-7 (Gen5 x16)", "2", "pcie"),
+        )
+        self.assertEqual((rows["cn-only01"]["mlx"], rows["cn-only01"]["mlx_count"], rows["cn-only01"]["mlx_source"]), ("", "0", ""))
+
+        code, text, _ = self.run_cli("show", "mlx-cx7-01", "--offline")
+        self.assertEqual(code, 0)
+        self.assertIn("Mellanox NIC: 2x ConnectX-7 (Gen5 x16)", text)
+        self.assertIn("Mellanox NICs:", text)
+        self.assertIn("0000:5c:00.0  ConnectX-7  [15b3:1021]  PCIe Gen5 x16 (cur Gen1 x16)", text)
+        self.assertIn("0001:5c:00.0  ConnectX-7  [15b3:1021]  PCIe Gen5 x16  Infiniband controller", text)
+
+        code, text, _ = self.run_cli("show", "booked-mlx-only01", "--offline")
+        self.assertEqual(code, 0)
+        self.assertIn("Mellanox NIC: ConnectX-5 Ex (Booked)", text)
+
+        code, text, _ = self.run_cli("show", "mlx_b2b_01", "--offline")
+        self.assertEqual(code, 0)
+        self.assertIn("mlx=2x ConnectX-7 (Gen5 x16)", text)
+
+        code, text, _ = self.run_cli("show", "MLX-DEV-02", "--offline")
+        self.assertEqual(code, 0)
+        self.assertIn("mlx=ConnectX-5 Ex (Booked)", text)
+
+        code, text, _ = self.run_cli("status")
+        self.assertEqual(code, 0)
+        self.assertIn("Mellanox: 2 probed host(s) (3 PCIe device(s))", text)
+
+        code, text, _ = self.run_cli("status", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(text)["mellanox"], {"hosts": 2, "devices": 3})
+
+    def test_remote_script_lspci_skips_virtual_functions_and_physfn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_lspci = bin_dir / "lspci"
+            fake_lspci.write_text(
+                "#!/usr/bin/env bash\n"
+                "cat <<'EOF'\n"
+                "0000:41:00.0 Ethernet controller [0200]: Mellanox Technologies MT2892 Family [ConnectX-6 Dx] [15b3:101d]\n"
+                "0000:41:00.2 Ethernet controller [0200]: Mellanox Technologies ConnectX-6 Dx Virtual Function [15b3:101e]\n"
+                "0000:41:01.0 Ethernet controller [0200]: Mellanox Technologies Device 101e [15b3:101e]\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            fake_lspci.chmod(0o755)
+            sys_pci = root / "sys/bus/pci/devices"
+            pf_dir = sys_pci / "0000:41:00.0"
+            vf_dir = sys_pci / "0000:41:01.0"
+            pf_dir.mkdir(parents=True)
+            vf_dir.mkdir(parents=True)
+            (pf_dir / "current_link_speed").write_text("16.0 GT/s PCIe\n", encoding="utf-8")
+            (pf_dir / "current_link_width").write_text("16\n", encoding="utf-8")
+            (pf_dir / "max_link_speed").write_text("16.0 GT/s PCIe\n", encoding="utf-8")
+            (pf_dir / "max_link_width").write_text("16\n", encoding="utf-8")
+            (vf_dir / "physfn").mkdir()
+            lspci_block = bi.REMOTE_SCRIPT.split("exec {lspci_fd}< <(\n", 1)[1].split("\n  # Enumerate x8+", 1)[0]
+            script = lspci_block.replace("/sys/bus/pci/devices", str(sys_pci))
+            env = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+            proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=True)
+            parsed = bi.parse_probe(f"@@LSPCI\n{proc.stdout}@@DONE\n")
+            self.assertEqual([(nic["pci"], nic["model"], nic["pcie_gen"], nic["pcie_width"]) for nic in parsed["nics"]], [("0000:41:00.0", "ConnectX-6 Dx", "Gen4", "x16")])
+
+    def test_skill_frontmatter_when_packaged(self) -> None:
+        skill_md = _ROOT / "skills" / "cnhwinv" / "SKILL.md"
+        if not skill_md.is_file():
+            self.skipTest("Not running in cn-ai-surplus package layout")
+        text = skill_md.read_text(encoding="utf-8")
+        match = bi.re.match(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", text, bi.re.S)
+        self.assertIsNotNone(match)
+        self.assertIn("name: cnhwinv\n", match.group(1))
+        self.assertIn("description:", match.group(1))
+        try:
+            import yaml
+        except ImportError:
+            return
+        doc = yaml.safe_load(match.group(1))
+        self.assertEqual(doc.get("name"), skill_md.parent.name)
+        self.assertIsInstance(doc.get("description"), str)
+        self.assertTrue(doc["description"].strip())
+
+    def test_install_sh_idempotent_install_and_uninstall_when_packaged(self) -> None:
+        installer = _ROOT / "install.sh"
+        if not installer.is_file():
+            self.skipTest("Not running in cn-ai-surplus package layout")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            agent_skills = root / "agent-skills"
+            oc_base = root / "opencode"
+            (oc_base / "bin").mkdir(parents=True)
+            (oc_base / "config" / "opencode").mkdir(parents=True)
+            ws = root / "ws"
+            (ws / ".opencode" / "skills").mkdir(parents=True)
+            env = {
+                **os.environ,
+                "FLEET_BIN": str(bin_dir),
+                "AGENT_SKILLS_DIR": str(agent_skills),
+                "CN_OPENCODE_BASE": str(oc_base),
+                "OPENCODE_SKILLS_DIR": str(oc_base / "config" / "opencode" / "skills"),
+            }
+            expected_links = (
+                bin_dir / "cnhwinv",
+                oc_base / "bin" / "cnhwinv",
+                agent_skills / "cnhwinv",
+                oc_base / "config" / "opencode" / "skills" / "cnhwinv",
+                ws / ".opencode" / "skills" / "cnhwinv",
+            )
+            dry = subprocess.run([str(installer), "--workspace", str(ws), "--dry-run"], env=env, capture_output=True, text=True, check=True)
+            self.assertIn("[dry-run] link", dry.stdout)
+            for link in expected_links:
+                self.assertFalse(link.exists())
+
+            res1 = subprocess.run([str(installer), "--workspace", str(ws)], env=env, capture_output=True, text=True, check=True)
+            self.assertIn("link", res1.stdout)
+            for link in expected_links:
+                self.assertTrue(link.is_symlink())
+
+            res2 = subprocess.run([str(installer), "--workspace", str(ws)], env=env, capture_output=True, text=True, check=True)
+            self.assertNotIn("link    ", res2.stdout)
+            self.assertEqual(res2.stdout.count("ok      "), len(expected_links))
+
+            res3 = subprocess.run([str(installer), "--workspace", str(ws), "--uninstall"], env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(res3.stdout.count("unlink  "), len(expected_links))
+            for link in expected_links:
+                self.assertFalse(link.exists())
 
 
 if __name__ == "__main__":

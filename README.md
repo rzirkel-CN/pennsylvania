@@ -1,5 +1,7 @@
 # cnhwinv — Cornelis Networks Hardware Inventory
 
+> **Archived / Read-Only Notice**: `cnhwinv` has moved to [`cornelisnetworks/cn-ai-surplus`](https://github.com/cornelisnetworks/cn-ai-surplus/tree/main/rzirkel/cnhwinv) under `rzirkel/cnhwinv/`. This repository (`rzirkel-CN/pennsylvania`) is now archived and read-only; all future development, CLI updates, and Agent Skill updates live in `cornelisnetworks/cn-ai-surplus`.
+
 `cnhwinv` is a single-file, Python 3.11 standard-library CLI for
 maintaining a local inventory of Booked Scheduler lab hosts and cached,
 read-only SSH fabric facts. `list` refreshes the cached Booked availability
@@ -63,6 +65,8 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 ./cnhwinv ls --gen 6k --reachable -w
 ./cnhwinv list --gpu                        # hosts with PCIe-probed or Booked GPU metadata
 ./cnhwinv list --gpu nvidia --available     # filter by GPU model/vendor/PCI ID substring
+./cnhwinv list --mlx                        # hosts with PCIe-probed or Booked Mellanox NICs
+./cnhwinv list --mlx connectx-7 --available # filter by Mellanox NIC model/device substring
 ./cnhwinv list --pcie '2x gen5'             # hosts with at least 2 PCIe Gen5 slots
 ./cnhwinv list --cpu arm                    # filter by CPU model or architecture (arm/x86)
 ./cnhwinv list --source discovered --json
@@ -72,7 +76,7 @@ the CLI and runs the test suite; the pre-push hook runs the suite again.
 ./cnhwinv ls --gen 5k -o csv > cn5000.csv   # also: -o tsv | jsonl | json
 
 # Host names are case-insensitive and support a unique partial match.
-# `show` prints all cached host/resource, adapter, GPU, port, LLDP, and Booked facts,
+# `show` prints all cached host/resource, adapter, GPU, Mellanox NIC, port, LLDP, and Booked facts,
 # plus live chassis power from each host's BMC (<short-host>-bmc, read-only
 # `ipmitool chassis power status`, queried in parallel for every mapped host).
 # BMC credentials come only from CNHWINV_BMC_USER / CNHWINV_BMC_PASSWORD
